@@ -16,6 +16,21 @@ local entitySpawnToken  = 0  -- increments each spawn request to cancel stale on
 -- defined earlier in the file write this local instead of a global.
 local hideHeadActive    = false
 
+-- Active headless/programmatic capture overrides and progress snapshot
+local activeCaptureOpts = nil
+local captureProgress   = nil
+
+-- Synced image storage & CDN mapping cache from server
+local RESOURCE_NAME = GetCurrentResourceName()
+local imageMappingState = {
+    storageType = 'local',
+    baseUrl     = ('https://cfx-nui-%s/shots'):format(RESOURCE_NAME),
+    format      = nil,
+    pathLayout  = nil,
+    mappings    = {},
+    synced      = false,
+}
+
 -- Orbit-camera state. Declared up here so every section below (orbit camera,
 -- capture start snapshot, NUI camera callbacks) shares the same values.
 local orbitCam      = nil
@@ -31,6 +46,33 @@ local pedAppearance = {
     model = nil, coords = nil, heading = nil,
     components = {}, props = {},
     headBlend = nil, faceFeatures = {}, headOverlays = {},
+}
+
+-- ════════════════════════════════════════════════════════
+-- FOLDER LAYOUTS & URL RESOLUTION
+-- ════════════════════════════════════════════════════════
+
+local LNS_COMPONENT_FOLDERS = {
+    [0]  = 'components',
+    [1]  = 'masks',
+    [2]  = 'hair',
+    [3]  = 'torsos',
+    [4]  = 'legs',
+    [5]  = 'bags',
+    [6]  = 'shoes',
+    [7]  = 'accessories',
+    [8]  = 'undershirts',
+    [9]  = 'armor',
+    [10] = 'decals',
+    [11] = 'tops',
+}
+
+local LNS_PROP_FOLDERS = {
+    [0] = 'hats',
+    [1] = 'glasses',
+    [2] = 'ears',
+    [6] = 'watches',
+    [7] = 'bracelets',
 }
 
 -- ════════════════════════════════════════════════════════
@@ -63,24 +105,187 @@ local function OtherGender(gender)
     return gender == 'male' and 'female' or 'male'
 end
 
--- Clothing framings are saved per gender (the female ped is shorter);
--- vehicle and object framings are shared.
 local function AngleKey(cam)
     if cam == 'vehicle' or cam == 'object' then return cam end
     return captureGender .. ':' .. cam
 end
 
--- A framing saved on the other gender still beats the preset default
 local function GetSavedAngle(cam)
     local own = savedCameraAngles[AngleKey(cam)]
     if own or cam == 'vehicle' or cam == 'object' then return own end
     return savedCameraAngles[OtherGender(captureGender) .. ':' .. cam]
 end
 
--- Extension the files are actually written with: bg removal always yields PNG
-local function SavedImageExt()
-    return Customize.TransparentBg and 'png' or (Customize.ScreenshotFormat or 'png')
+local function NormalizeFormat(fmt)
+    local f = tostring(fmt or 'png'):lower()
+    if f == 'jpeg' then f = 'jpg' end
+    if f ~= 'png' and f ~= 'webp' and f ~= 'jpg' then f = 'png' end
+    return f
 end
+
+-- Both PNG and WebP preserve chroma-removed alpha; only JPG forces PNG fallback.
+local function SavedImageExt(fmtOverride, transparentOverride)
+    local transp = transparentOverride
+    if transp == nil then
+        transp = (activeCaptureOpts and activeCaptureOpts.transparent ~= nil)
+            and activeCaptureOpts.transparent
+            or Customize.TransparentBg
+    end
+    local fmt = NormalizeFormat(
+        fmtOverride
+        or (activeCaptureOpts and activeCaptureOpts.format)
+        or Customize.ScreenshotFormat
+        or 'png'
+    )
+    if transp and fmt == 'jpg' then return 'png' end
+    return fmt
+end
+
+local function GetPathLayout(layoutOverride)
+    local raw = tostring(
+        layoutOverride
+        or (activeCaptureOpts and activeCaptureOpts.pathLayout)
+        or Customize.PathLayout
+        or 'autoshot'
+    ):lower()
+    return raw == 'lns_appearance' and 'lns_appearance' or 'autoshot'
+end
+
+local function NormalizeImageKey(rawKey)
+    if type(rawKey) ~= 'string' then return nil end
+    local k = rawKey:gsub('^/+', ''):gsub('/+$', '')
+    k = k:gsub('%.webp$', ''):gsub('%.png$', ''):gsub('%.jpeg$', ''):gsub('%.jpg$', '')
+    if k == '' then return nil end
+    return k
+end
+
+local function TattooFilename(gender, collection, overlay)
+    return ('%s/tattoos/%s/%s'):format(gender, tostring(collection):lower(), tostring(overlay):lower())
+end
+
+local function BuildPhotoKey(gender, itemType, id, drawable, texture, layoutOverride)
+    local layout = GetPathLayout(layoutOverride)
+    local g = gender == 'female' and 'female' or 'male'
+
+    if itemType == 'tattoo' then
+        return TattooFilename(g, id, drawable)
+    elseif itemType == 'vehicle' then
+        return 'vehicles/' .. tostring(id)
+    elseif itemType == 'object' then
+        return 'objects/' .. tostring(id)
+    end
+
+    local numId = tonumber(id) or 0
+    local numDraw = tonumber(drawable) or 0
+    local numTex = tonumber(texture) or 0
+
+    if layout == 'lns_appearance' then
+        if itemType == 'component' then
+            local folder = LNS_COMPONENT_FOLDERS[numId] or ('component_' .. numId)
+            return ('%s/%s/%d/%d'):format(g, folder, numDraw, numTex)
+        elseif itemType == 'prop' then
+            local folder = LNS_PROP_FOLDERS[numId] or ('prop_' .. numId)
+            return ('%s/%s/%d/%d'):format(g, folder, numDraw, numTex)
+        elseif itemType == 'overlay' then
+            return ('%s/overlays/%d/%d'):format(g, numId, numDraw)
+        end
+    end
+
+    -- Default 'autoshot' layout
+    if itemType == 'component' then
+        return numTex > 0
+            and ('%s/%d/%d_%d'):format(g, numId, numDraw, numTex)
+            or  ('%s/%d/%d'):format(g, numId, numDraw)
+    elseif itemType == 'prop' then
+        return numTex > 0
+            and ('%s/prop_%d/%d_%d'):format(g, numId, numDraw, numTex)
+            or  ('%s/prop_%d/%d'):format(g, numId, numDraw)
+    elseif itemType == 'overlay' then
+        return ('%s/overlay_%d/%d'):format(g, numId, numDraw)
+    end
+
+    return nil
+end
+
+local function ResolveKeyURL(rawKey, extOverride)
+    local key = NormalizeImageKey(rawKey)
+    if not key then return nil end
+
+    if imageMappingState.mappings and imageMappingState.mappings[key] then
+        return imageMappingState.mappings[key]
+    end
+
+    local base = imageMappingState.baseUrl
+    if base and base ~= '' then
+        base = base:gsub('/+$', '')
+        return ('%s/%s.%s'):format(base, key, extOverride or SavedImageExt())
+    end
+
+    return nil
+end
+
+local function ResolvePhotoURL(gender, itemType, id, drawable, texture, opts, mappedOnly)
+    local preferredLayout = opts and opts.pathLayout
+    local ext = opts and opts.format and NormalizeFormat(opts.format) or SavedImageExt()
+    local primaryKey = BuildPhotoKey(gender, itemType, id, drawable, texture, preferredLayout)
+    if not primaryKey then return nil end
+
+    if imageMappingState.mappings and imageMappingState.mappings[primaryKey] then
+        return imageMappingState.mappings[primaryKey]
+    end
+
+    -- Check alternate layout key in synced mappings so screenshots remain findable
+    -- regardless of which PathLayout was active when they were shot.
+    if not preferredLayout then
+        local altLayout = GetPathLayout() == 'lns_appearance' and 'autoshot' or 'lns_appearance'
+        local altKey = BuildPhotoKey(gender, itemType, id, drawable, texture, altLayout)
+        if altKey and imageMappingState.mappings and imageMappingState.mappings[altKey] then
+            return imageMappingState.mappings[altKey]
+        end
+    end
+
+    if mappedOnly then return nil end
+    return ResolveKeyURL(primaryKey, ext)
+end
+
+-- ════════════════════════════════════════════════════════
+-- SERVER MAPPING SYNC EVENTS
+-- ════════════════════════════════════════════════════════
+
+RegisterNetEvent('uz_autoshot:client:syncMappings', function(data)
+    if type(data) ~= 'table' then return end
+    imageMappingState.storageType = data.storageType or imageMappingState.storageType
+    imageMappingState.baseUrl     = data.baseUrl ~= nil and data.baseUrl or imageMappingState.baseUrl
+    imageMappingState.format      = data.format or imageMappingState.format
+    imageMappingState.pathLayout  = data.pathLayout or imageMappingState.pathLayout
+    imageMappingState.mappings    = type(data.mappings) == 'table' and data.mappings or {}
+    imageMappingState.synced      = true
+    TriggerEvent('uz_autoshot:client:mappingsChanged', imageMappingState)
+end)
+
+RegisterNetEvent('uz_autoshot:client:mappingUpdated', function(key, url)
+    if type(key) ~= 'string' or type(url) ~= 'string' then return end
+    imageMappingState.mappings[key] = url
+    TriggerEvent('uz_autoshot:client:mappingsChanged', imageMappingState, { [key] = url })
+end)
+
+RegisterNetEvent('uz_autoshot:client:mappingsPatch', function(patch)
+    if type(patch) ~= 'table' then return end
+    for k, v in pairs(patch) do
+        imageMappingState.mappings[k] = v
+    end
+    TriggerEvent('uz_autoshot:client:mappingsChanged', imageMappingState, patch)
+end)
+
+CreateThread(function()
+    while not NetworkIsSessionStarted() do Wait(250) end
+    Wait(500)
+    TriggerServerEvent('uz_autoshot:server:requestMappings')
+end)
+
+-- ════════════════════════════════════════════════════════
+-- VEHICLES & MODEL HELPERS
+-- ════════════════════════════════════════════════════════
 
 local resolvedVehicleCategories = nil
 
@@ -104,7 +309,6 @@ local function GetVehicleCategories()
         return cfg
     end
 
-    -- 'auto' mode: detect all vehicle models, grouped by class
     local models = GetAllVehicleModels()
     local byClass = {}
     if models then
@@ -119,7 +323,6 @@ local function GetVehicleCategories()
         end
     end
 
-    -- Sort classes by id, models alphabetically
     local list = {}
     local classIds = {}
     for id in pairs(byClass) do classIds[#classIds + 1] = id end
@@ -165,13 +368,6 @@ local function CreateCaptureCamera(entity, preset, presetName)
         lookZ = pedPos.z + zP
         roll  = saved.roll or 0.0
     elseif preset.defaultAngleH then
-        -- Unsaved preset: frame it exactly like the preview does when this
-        -- category is selected (SetOrbitPreset). The category that was on
-        -- screen when capture started is snapshotted into savedCameraAngles
-        -- (SnapshotOrbitAngle), so it never lands here. Reading the live
-        -- orbit state instead would hand every unsaved category the last
-        -- previewed category's angle/distance (back-facing shots after a
-        -- Bags/Decals preview, camera inside the car after a clothing one).
         local dist = preset.dist or 1.2
         local aH   = math.rad(preset.defaultAngleH)
         local cZ   = preset.defaultCamZ or 0.0
@@ -182,8 +378,6 @@ local function CreateCaptureCamera(entity, preset, presetName)
         lookZ = pedPos.z + preset.zPos
         roll  = preset.defaultRoll or 0.0
     else
-        -- Legacy preset without defaultAngleH: rotate ped to align with
-        -- camera, then place camera behind ped's forward vector.
         local rotZ = preset.rotation.z + captureRotOffset
         SetEntityRotation(entity, preset.rotation.x, preset.rotation.y, rotZ, 2, false)
         Wait(50)
@@ -245,7 +439,16 @@ local function DrawGreenScreenAndLights(entity)
         gs     = Customize.GreenScreen
         lights = Customize.StudioLights
     end
-    local r, g, b = Customize.GreenScreen.color.r, Customize.GreenScreen.color.g, Customize.GreenScreen.color.b
+
+    local chromaPreset = (activeCaptureOpts and activeCaptureOpts.chromaKey) or Customize.ChromaKeyColor
+    local r, g, b
+    if chromaPreset == 'green' then
+        r, g, b = 0, 177, 64
+    elseif chromaPreset == 'magenta' then
+        r, g, b = 255, 0, 255
+    else
+        r, g, b = Customize.GreenScreen.color.r, Customize.GreenScreen.color.g, Customize.GreenScreen.color.b
+    end
 
     local hw = gs.width  * 0.5
     local hd = gs.depth  * 0.5
@@ -317,7 +520,6 @@ end
 
 -- ════════════════════════════════════════════════════════
 -- ORBIT CAMERA
--- (state variables hoisted to the top of the file)
 -- ════════════════════════════════════════════════════════
 
 local function UpdateOrbitCamera()
@@ -357,8 +559,8 @@ local function SetOrbitPreset(presetName)
 end
 
 local function CreateOrbitCamera(ped, presetName)
-    local pName = presetName or (Customize.Categories[1] and Customize.Categories[1].camera) or 'torso'
-    local preset = Customize.CameraPresets[pName]
+    local pName = presetName or (Customize.Categories[1] and Customize.Categories[1].camera) or 'tops'
+    local preset = Customize.CameraPresets[pName] or Customize.CameraPresets['tops']
     local pedPos = GetEntityCoords(ped)
     activePreviewCamera = pName
 
@@ -366,10 +568,6 @@ local function CreateOrbitCamera(ped, presetName)
     orbitBaseDist = preset.dist or 1.2
     orbitDist     = orbitBaseDist
     orbitFov      = preset.fov
-    -- Match SetOrbitPreset: honor preset's defaultAngleH so the camera lands in
-    -- front of the ped on entry. Falling back to GetEntityHeading + 180 keeps
-    -- presets without an explicit angle on the ped's face side too — orbit math
-    -- subtracts cos, so naked heading would put us behind the ped.
     if preset.defaultAngleH then
         orbitAngleH = math.rad(preset.defaultAngleH)
     else
@@ -407,16 +605,13 @@ local function ForceHighQuality()
 end
 
 local function WaitForClothingLoaded(ped, componentId, drawableId, textureId)
-    -- Preload texture
     SetPedPreloadVariationData(ped, componentId, drawableId, textureId)
     local timeout = GetGameTimer() + 800
     while not HasPedPreloadVariationDataFinished(ped) and GetGameTimer() < timeout do
         Wait(0)
     end
-    -- Apply
     SetPedComponentVariation(ped, componentId, drawableId, textureId, 0)
     ReleasePedPreloadVariationData(ped)
-    -- Force HD + 2 render frames
     ForceHighQuality()
     SetEntityLodDist(ped, 10000)
     Wait(0)
@@ -447,12 +642,15 @@ end
 
 local function WaitForResume()
     if not isPaused then return end
-    SendNUIMessage({ type = 'setCapturePaused', paused = true })
-    SetNuiFocus(true, true)
+    local hideUi = activeCaptureOpts and activeCaptureOpts.hideOverlay == true
+    if not hideUi then
+        SendNUIMessage({ type = 'setCapturePaused', paused = true })
+        SetNuiFocus(true, true)
+    end
 
     while isPaused and not isCancelled do Wait(200) end
 
-    if not isCancelled then
+    if not isCancelled and not hideUi then
         SendNUIMessage({ type = 'setCapturePaused', paused = false })
         SetNuiFocus(false, false)
         Wait(50)
@@ -463,15 +661,10 @@ end
 -- CAPTURE & UPLOAD
 -- ════════════════════════════════════════════════════════
 
--- Uploads the server hasn't confirmed yet: upload id -> send time.
--- Latent events have no backpressure of their own: every queued event is sent
--- in parallel at LatentRate, so on a slow uplink an unthrottled capture loop
--- keeps stacking multi-MB frames until the connection times out. Localhost
--- never shows this because the "uplink" is unlimited.
 local pendingUploads     = {}
 local pendingCount       = 0
 local nextUploadId       = 0
-local UPLOAD_ACK_TIMEOUT = 60000
+local UPLOAD_ACK_TIMEOUT = 90000
 
 RegisterNetEvent('uz_autoshot:client:captureProcessed', function(uploadId)
     if pendingUploads[uploadId] then
@@ -494,16 +687,16 @@ local function WaitForPendingUploads(limit)
     end
 end
 
--- Reply to the readiness ping; nil while waiting
 local serverStatus = nil
 RegisterNetEvent('uz_autoshot:client:pong', function(status) serverStatus = status end)
 
--- A broken server side (server.js failed to load, pngjs missing) otherwise only
--- shows up as every upload timing out one by one: a capture that looks frozen
--- and an empty shots/ folder. Ask once before entering the studio instead.
-local function ServerReady()
+local function ServerReady(opts)
     serverStatus = nil
-    TriggerServerEvent('uz_autoshot:server:ping')
+    local pingPayload = {
+        format = (opts and opts.format) or Customize.ScreenshotFormat or 'png',
+        transparent = (opts and opts.transparent ~= nil) and opts.transparent or Customize.TransparentBg,
+    }
+    TriggerServerEvent('uz_autoshot:server:ping', pingPayload)
     local timeout = GetGameTimer() + 5000
     while serverStatus == nil and GetGameTimer() < timeout do Wait(50) end
 
@@ -513,32 +706,59 @@ local function ServerReady()
     elseif not serverStatus.ok then
         reason = serverStatus.reason or 'Server refused captures.'
     else
-        return true
+        return true, nil
     end
 
     print('^1[uz_AutoShot]^0 ' .. reason)
-    BeginTextCommandThefeedPost('STRING')
-    AddTextComponentSubstringPlayerName('uz_AutoShot: ' .. reason)
-    EndTextCommandThefeedPostTicker(false, false)
-    return false
+    if not (opts and opts.silentNotify) then
+        BeginTextCommandThefeedPost('STRING')
+        AddTextComponentSubstringPlayerName('uz_AutoShot: ' .. reason)
+        EndTextCommandThefeedPostTicker(false, false)
+    end
+    return false, reason
+end
+
+local function RequestGameScreenshot(opts, cb)
+    if GetResourceState('screencapture') == 'started' then
+        exports.screencapture:requestScreenshot(opts, cb)
+    elseif GetResourceState('screenshot-basic') == 'started' then
+        exports['screenshot-basic']:requestScreenshot(opts, cb)
+    else
+        cb(nil)
+    end
+end
+
+local function ShouldSkipKey(key)
+    if not (activeCaptureOpts and activeCaptureOpts.skipExisting) then return false end
+    return imageMappingState.mappings and imageMappingState.mappings[key] ~= nil
 end
 
 local function CaptureAndUpload(filename)
     WaitForPendingUploads((Customize.MaxPendingUploads or 2) - 1)
-    if isCancelled then return end
+    if isCancelled then return false end
 
     ForceHighQuality()
 
-    local encoding = Customize.ScreenshotFormat or 'png'
-    if Customize.TransparentBg then encoding = 'png' end
+    local wantTransp = (activeCaptureOpts and activeCaptureOpts.transparent ~= nil)
+        and activeCaptureOpts.transparent
+        or Customize.TransparentBg
+    local wantWidth  = (activeCaptureOpts and activeCaptureOpts.width) or Customize.ScreenshotWidth or 0
+    local wantHeight = (activeCaptureOpts and activeCaptureOpts.height) or Customize.ScreenshotHeight or 0
+    local outFormat  = SavedImageExt(activeCaptureOpts and activeCaptureOpts.format, wantTransp)
+    local quality    = (activeCaptureOpts and activeCaptureOpts.quality) or Customize.ScreenshotQuality or 0.85
+    local chromaKey  = (activeCaptureOpts and activeCaptureOpts.chromaKey) or Customize.ChromaKeyColor or 'green'
 
-    local opts = { encoding = encoding }
-    if encoding ~= 'png' then
-        opts.quality = Customize.ScreenshotQuality
+    -- Capture lossless PNG whenever the server needs to decode RGBA (chroma key, resize, or WebP encoding)
+    local needPngCapture = wantTransp or (wantWidth > 0 and wantHeight > 0) or outFormat == 'webp' or outFormat == 'png'
+    local captureEncoding = needPngCapture and 'png' or 'jpg'
+
+    local opts = { encoding = captureEncoding }
+    if captureEncoding ~= 'png' then
+        opts.quality = quality
     end
 
     local done, base64 = false, nil
-    exports['screenshot-basic']:requestScreenshot(opts, function(data)
+    RequestGameScreenshot(opts, function(data)
         base64 = data
         done = true
     end)
@@ -547,12 +767,12 @@ local function CaptureAndUpload(filename)
     while not done and GetGameTimer() < timeout do Wait(50) end
 
     if not done then
-        print('^3[uz_AutoShot]^0 Capture skipped (' .. filename .. '): screenshot-basic did not respond within 10s')
-        return
+        print('^3[uz_AutoShot]^0 Capture skipped (' .. filename .. '): screenshot resource did not respond within 10s')
+        return false
     end
     if not base64 or base64 == '' then
-        print('^3[uz_AutoShot]^0 Capture skipped (' .. filename .. '): screenshot-basic returned no image data')
-        return
+        print('^3[uz_AutoShot]^0 Capture skipped (' .. filename .. '): screenshot resource returned no image data')
+        return false
     end
 
     nextUploadId = nextUploadId + 1
@@ -560,19 +780,35 @@ local function CaptureAndUpload(filename)
     pendingCount = pendingCount + 1
 
     TriggerLatentServerEvent('uz_autoshot:server:processCapture', Customize.LatentRate or 8000000, {
-        id          = nextUploadId,
-        filename    = filename,
-        format      = encoding,
-        transparent = Customize.TransparentBg and true or false,
-        chromaKey   = Customize.ChromaKeyColor or 'green',
-        width       = Customize.ScreenshotWidth or 0,
-        height      = Customize.ScreenshotHeight or 0,
-        imageData   = base64,
+        id           = nextUploadId,
+        filename     = filename,
+        format       = captureEncoding,
+        outputFormat = outFormat,
+        quality      = quality,
+        transparent  = wantTransp and true or false,
+        chromaKey    = chromaKey,
+        width        = wantWidth,
+        height       = wantHeight,
+        imageData    = base64,
     })
+    return true
 end
 
-local function SendProgress(current, total, category)
-    SendNUIMessage({ type = 'captureProgress', current = current, total = total, category = category })
+local function SendProgress(current, total, category, phase)
+    captureProgress = {
+        current  = current,
+        total    = total,
+        category = category,
+        phase    = phase or captureMode,
+        gender   = captureGender,
+    }
+    TriggerEvent('uz_autoshot:client:progress', captureProgress)
+    if activeCaptureOpts and type(activeCaptureOpts.onProgress) == 'function' then
+        pcall(activeCaptureOpts.onProgress, current, total, category, phase or captureMode)
+    end
+    if not (activeCaptureOpts and activeCaptureOpts.hideOverlay) then
+        SendNUIMessage({ type = 'captureProgress', current = current, total = total, category = category })
+    end
 end
 
 local batchCounter = 0
@@ -586,9 +822,7 @@ end
 -- PED APPEARANCE — Save / Restore
 -- ════════════════════════════════════════════════════════
 
--- Appearance resources exposing getPedAppearance / setPedAppearance (same API).
--- Natives can't read tattoos at all, so only these hold the full look.
-local APPEARANCE_PROVIDERS = { 'illenium-appearance', 'fivem-appearance' }
+local APPEARANCE_PROVIDERS = { 'LNS_Appearance', 'illenium-appearance', 'fivem-appearance' }
 
 local function GetAppearanceProvider()
     for _, name in ipairs(APPEARANCE_PROVIDERS) do
@@ -597,9 +831,6 @@ local function GetAppearanceProvider()
     return nil
 end
 
--- GET_PED_HEAD_BLEND_DATA fills a struct; the plain Lua wrapper only returns
--- the bool. Reading through consecutive pointer slots is the same workaround
--- illenium-appearance uses.
 local function ReadHeadBlend(ped)
     local shapeFirst, shapeSecond, shapeThird, skinFirst, skinSecond, skinThird, shapeMix, skinMix, thirdMix =
         Citizen.InvokeNative(0x2746BD9D88C5C5D0, ped,
@@ -654,7 +885,6 @@ local function SaveFullAppearance(ped)
     pedAppearance.hair     = { color = GetPedHairColor(ped), highlight = GetPedHairHighlightColor(ped) }
     pedAppearance.eyeColor = GetPedEyeColor(ped)
 
-    -- Full snapshot (tattoos included) from the appearance resource, if any
     pedAppearance.provider = GetAppearanceProvider()
     pedAppearance.full     = nil
     if pedAppearance.provider then
@@ -676,10 +906,6 @@ local function RestoreFullAppearance()
 
     local ped = PlayerPedId()
 
-    -- Pre-stream the world at the restore coords. Studio sat at -150z in a
-    -- separate routing bucket, so the original location's collision/IPLs were
-    -- unloaded; without an explicit wait the player drops through unloaded
-    -- ground the moment we re-enable collision.
     if pedAppearance.coords then
         local x, y, z = pedAppearance.coords.x, pedAppearance.coords.y, pedAppearance.coords.z
 
@@ -704,8 +930,6 @@ local function RestoreFullAppearance()
         ClearFocus()
     end
 
-    -- SetPlayerModel above created a fresh ped, so everything must be reapplied.
-    -- Prefer the appearance resource: it is the only source that has tattoos.
     local restored = false
     local provider = pedAppearance.provider
     if pedAppearance.full and provider and GetResourceState(provider) == 'started' then
@@ -769,7 +993,6 @@ local function SetupCapturePed(modelHash)
     Wait(150)
 
     local ped = PlayerPedId()
-    -- Head blend parents 0-20 are male faces, 21+ female; same skin for both
     local face = modelHash == GetHashKey(GENDER_MODELS.female) and 21 or 0
     SetPedHeadBlendData(ped, face, 0, 0, 0, 0, 0, 0.0, 0.0, 0.0, false)
     SetEntityCoordsNoOffset(ped, Customize.StudioCoords.x, Customize.StudioCoords.y, Customize.StudioCoords.z, false, false, false)
@@ -811,10 +1034,6 @@ end
 -- VEHICLE / OBJECT SPAWN HELPERS
 -- ════════════════════════════════════════════════════════
 
--- token: entitySpawnToken at request time. If a newer request (or capture
--- start) bumped it while the model was streaming, spawning now would orphan
--- or clobber the newer entity, so bail out. No yield between this check and
--- the spawnedEntity assignment below.
 local function SpawnStudioVehicle(modelName, token)
     local hash = GetHashKey(modelName)
     if not LoadModel(hash) then return nil end
@@ -824,8 +1043,6 @@ local function SpawnStudioVehicle(modelName, token)
     end
 
     local sx, sy, sz = Customize.StudioCoords.x, Customize.StudioCoords.y, Customize.StudioCoords.z
-
-    -- Spawn at player position first (FiveM streams here), then teleport
     local playerPos = GetEntityCoords(PlayerPedId())
     local veh = CreateVehicle(hash, playerPos.x, playerPos.y, playerPos.z, Customize.StudioHeading, false, false)
     if not DoesEntityExist(veh) then return nil end
@@ -835,7 +1052,6 @@ local function SpawnStudioVehicle(modelName, token)
     SetEntityCollision(veh, false, false)
     FreezeEntityPosition(veh, true)
 
-    -- Teleport to studio — raise slightly so wheels don't clip, then hard freeze
     SetEntityCoordsNoOffset(veh, sx, sy, sz + 1.0, false, false, false)
     SetEntityHeading(veh, Customize.StudioHeading)
     FreezeEntityPosition(veh, true)
@@ -859,7 +1075,6 @@ local function SpawnStudioObject(modelName, token)
     end
 
     local sx, sy, sz = Customize.StudioCoords.x, Customize.StudioCoords.y, Customize.StudioCoords.z
-
     local playerPos = GetEntityCoords(PlayerPedId())
     local obj = CreateObject(hash, playerPos.x, playerPos.y, playerPos.z, false, false, false)
     if not DoesEntityExist(obj) then return nil end
@@ -869,7 +1084,6 @@ local function SpawnStudioObject(modelName, token)
     SetEntityCollision(obj, false, false)
     FreezeEntityPosition(obj, true)
 
-    -- Teleport to studio — fixed ground level
     SetEntityCoordsNoOffset(obj, sx, sy, sz, false, false, false)
     PlaceObjectOnGroundProperly(obj)
     FreezeEntityPosition(obj, true)
@@ -885,7 +1099,6 @@ local function DeleteStudioEntity()
         if DoesEntityExist(ent) then
             SetEntityAsMissionEntity(ent, true, true)
             DeleteEntity(ent)
-            -- Fallback if still exists
             if DoesEntityExist(ent) then
                 SetEntityAsNoLongerNeeded(ent)
                 DeleteEntity(ent)
@@ -901,8 +1114,6 @@ local function GetEntityTargetPos()
     return GetEntityCoords(PlayerPedId())
 end
 
--- Store the live orbit framing under a camera preset name, with zPos relative
--- to whatever the camera is looking at (spawned entity, or the ped).
 local function SnapshotOrbitAngle(cam)
     savedCameraAngles[AngleKey(cam)] = {
         angleH = orbitAngleH,
@@ -941,7 +1152,7 @@ end
 -- ════════════════════════════════════════════════════════
 
 local function SetupCategoryCamera(ped, cameraName)
-    local preset   = Customize.CameraPresets[cameraName]
+    local preset   = Customize.CameraPresets[cameraName] or Customize.CameraPresets['tops']
     local hasSaved = GetSavedAngle(cameraName) ~= nil
     DestroyCamera()
     captureCamera = CreateCaptureCamera(ped, preset, cameraName)
@@ -949,25 +1160,31 @@ local function SetupCategoryCamera(ped, cameraName)
 end
 
 local function ReapplyRotation(ped, preset, hasSaved)
-    -- Only legacy presets without defaultAngleH need the ped rotated so the
-    -- behind-the-back camera math frames the front. Modern (defaultAngleH)
-    -- presets and the saved branch keep the ped at studio heading and let
-    -- the orbit-positioned camera frame the shot — rotating here would flip
-    -- the ped 180° relative to the preview the user just confirmed.
     if hasSaved or preset.defaultAngleH then return end
     SetEntityRotation(ped, preset.rotation.x, preset.rotation.y, preset.rotation.z + captureRotOffset, 2, false)
 end
 
 local function CaptureComponents(ped, gender, selectedSet)
     local totalItems, captured = 0, 0
+    local allTextures = (activeCaptureOpts and activeCaptureOpts.allTextures ~= nil)
+        and activeCaptureOpts.allTextures
+        or Customize.CaptureAllTextures
+    local rangeMin = activeCaptureOpts and tonumber(activeCaptureOpts.startDrawable)
+    local rangeMax = activeCaptureOpts and tonumber(activeCaptureOpts.endDrawable)
 
     for _, cat in ipairs(Customize.Categories) do
         if not selectedSet or selectedSet[cat.componentId] then
             local n = GetNumberOfPedDrawableVariations(ped, cat.componentId)
-            if Customize.CaptureAllTextures then
-                for d = 0, n - 1 do totalItems = totalItems + GetNumberOfPedTextureVariations(ped, cat.componentId, d) end
-            else
-                totalItems = totalItems + n
+            local dStart = rangeMin and math.max(0, rangeMin) or 0
+            local dEnd   = rangeMax and math.min(n - 1, rangeMax) or (n - 1)
+            if dEnd >= dStart then
+                if allTextures then
+                    for d = dStart, dEnd do
+                        totalItems = totalItems + GetNumberOfPedTextureVariations(ped, cat.componentId, d)
+                    end
+                else
+                    totalItems = totalItems + (dEnd - dStart + 1)
+                end
             end
         end
     end
@@ -976,32 +1193,41 @@ local function CaptureComponents(ped, gender, selectedSet)
         if isCancelled then return end
         if selectedSet and not selectedSet[cat.componentId] then goto nextComp end
 
+        local numDrawables = GetNumberOfPedDrawableVariations(ped, cat.componentId)
+        local dStart = rangeMin and math.max(0, rangeMin) or 0
+        local dEnd   = rangeMax and math.min(numDrawables - 1, rangeMax) or (numDrawables - 1)
+        if dEnd < dStart then goto nextComp end
+
         ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides)
         hideHeadActive = cat.hideHead or false
         local preset, hasSaved = SetupCategoryCamera(ped, cat.camera)
 
-        for drawableId = 0, GetNumberOfPedDrawableVariations(ped, cat.componentId) - 1 do
+        for drawableId = dStart, dEnd do
             if isCancelled then return end
-            local maxTex = Customize.CaptureAllTextures and GetNumberOfPedTextureVariations(ped, cat.componentId, drawableId) - 1 or 0
+            local maxTex = allTextures and (GetNumberOfPedTextureVariations(ped, cat.componentId, drawableId) - 1) or 0
 
             for textureId = 0, maxTex do
                 if isCancelled then return end
                 WaitForResume()
                 if isCancelled then return end
 
-                WaitForClothingLoaded(ped, cat.componentId, drawableId, textureId)
-                ReapplyRotation(ped, preset, hasSaved)
-                Wait(Customize.WaitAfterApply)
+                local filename = BuildPhotoKey(gender, 'component', cat.componentId, drawableId, textureId)
+                if ShouldSkipKey(filename) then
+                    captured = captured + 1
+                    SendProgress(captured, totalItems, cat.label, 'components')
+                    if captured % 50 == 0 then Wait(0) end
+                else
+                    WaitForClothingLoaded(ped, cat.componentId, drawableId, textureId)
+                    ReapplyRotation(ped, preset, hasSaved)
+                    Wait(Customize.WaitAfterApply)
 
-                local filename = textureId > 0
-                    and ('%s/%d/%d_%d'):format(gender, cat.componentId, drawableId, textureId)
-                    or  ('%s/%d/%d'):format(gender, cat.componentId, drawableId)
-                CaptureAndUpload(filename)
+                    CaptureAndUpload(filename)
 
-                captured = captured + 1
-                SendProgress(captured, totalItems, cat.label)
-                Wait(Customize.WaitAfterCapture)
-                ThrottledWait()
+                    captured = captured + 1
+                    SendProgress(captured, totalItems, cat.label, 'components')
+                    Wait(Customize.WaitAfterCapture)
+                    ThrottledWait()
+                end
             end
         end
 
@@ -1011,14 +1237,25 @@ end
 
 local function CaptureProps(ped, gender, selectedSet)
     local totalItems, captured = 0, 0
+    local allTextures = (activeCaptureOpts and activeCaptureOpts.allTextures ~= nil)
+        and activeCaptureOpts.allTextures
+        or Customize.CaptureAllTextures
+    local rangeMin = activeCaptureOpts and tonumber(activeCaptureOpts.startDrawable)
+    local rangeMax = activeCaptureOpts and tonumber(activeCaptureOpts.endDrawable)
 
     for _, cat in ipairs(Customize.PropCategories) do
         if not selectedSet or selectedSet[cat.propId] then
             local n = GetNumberOfPedPropDrawableVariations(ped, cat.propId)
-            if Customize.CaptureAllTextures then
-                for d = 0, n - 1 do totalItems = totalItems + GetNumberOfPedPropTextureVariations(ped, cat.propId, d) end
-            else
-                totalItems = totalItems + n
+            local dStart = rangeMin and math.max(0, rangeMin) or 0
+            local dEnd   = rangeMax and math.min(n - 1, rangeMax) or (n - 1)
+            if dEnd >= dStart then
+                if allTextures then
+                    for d = dStart, dEnd do
+                        totalItems = totalItems + GetNumberOfPedPropTextureVariations(ped, cat.propId, d)
+                    end
+                else
+                    totalItems = totalItems + (dEnd - dStart + 1)
+                end
             end
         end
     end
@@ -1027,33 +1264,42 @@ local function CaptureProps(ped, gender, selectedSet)
         if isCancelled then return end
         if selectedSet and not selectedSet[cat.propId] then goto nextProp end
 
+        local numDrawables = GetNumberOfPedPropDrawableVariations(ped, cat.propId)
+        local dStart = rangeMin and math.max(0, rangeMin) or 0
+        local dEnd   = rangeMax and math.min(numDrawables - 1, rangeMax) or (numDrawables - 1)
+        if dEnd < dStart then goto nextProp end
+
         ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides)
         hideHeadActive = cat.hideHead or false
         local preset, hasSaved = SetupCategoryCamera(ped, cat.camera)
         PlayCategoryAnim(ped, cat.anim)
 
-        for drawableId = 0, GetNumberOfPedPropDrawableVariations(ped, cat.propId) - 1 do
+        for drawableId = dStart, dEnd do
             if isCancelled then return end
-            local maxTex = Customize.CaptureAllTextures and GetNumberOfPedPropTextureVariations(ped, cat.propId, drawableId) - 1 or 0
+            local maxTex = allTextures and (GetNumberOfPedPropTextureVariations(ped, cat.propId, drawableId) - 1) or 0
 
             for textureId = 0, maxTex do
                 if isCancelled then return end
                 WaitForResume()
                 if isCancelled then return end
 
-                WaitForPropLoaded(ped, cat.propId, drawableId, textureId)
-                ReapplyRotation(ped, preset, hasSaved)
-                Wait(Customize.WaitAfterApply)
+                local filename = BuildPhotoKey(gender, 'prop', cat.propId, drawableId, textureId)
+                if ShouldSkipKey(filename) then
+                    captured = captured + 1
+                    SendProgress(captured, totalItems, cat.label, 'props')
+                    if captured % 50 == 0 then Wait(0) end
+                else
+                    WaitForPropLoaded(ped, cat.propId, drawableId, textureId)
+                    ReapplyRotation(ped, preset, hasSaved)
+                    Wait(Customize.WaitAfterApply)
 
-                local filename = textureId > 0
-                    and ('%s/prop_%d/%d_%d'):format(gender, cat.propId, drawableId, textureId)
-                    or  ('%s/prop_%d/%d'):format(gender, cat.propId, drawableId)
-                CaptureAndUpload(filename)
+                    CaptureAndUpload(filename)
 
-                captured = captured + 1
-                SendProgress(captured, totalItems, cat.label)
-                Wait(Customize.WaitAfterCapture)
-                ThrottledWait()
+                    captured = captured + 1
+                    SendProgress(captured, totalItems, cat.label, 'props')
+                    Wait(Customize.WaitAfterCapture)
+                    ThrottledWait()
+                end
             end
         end
 
@@ -1063,7 +1309,6 @@ local function CaptureProps(ped, gender, selectedSet)
     end
 end
 
--- Helper: apply overlay with correct color from config
 local function ApplyOverlayWithColor(ped, overlayIndex, variationId)
     SetPedHeadOverlay(ped, overlayIndex, variationId, 1.0)
     for _, cat in ipairs(Customize.OverlayCategories or {}) do
@@ -1081,10 +1326,17 @@ end
 local function CaptureOverlays(ped, gender, selectedSet)
     local cats = Customize.OverlayCategories or {}
     local totalItems, captured = 0, 0
+    local rangeMin = activeCaptureOpts and tonumber(activeCaptureOpts.startDrawable)
+    local rangeMax = activeCaptureOpts and tonumber(activeCaptureOpts.endDrawable)
 
     for _, cat in ipairs(cats) do
         if not selectedSet or selectedSet[cat.overlayIndex] then
-            totalItems = totalItems + GetPedHeadOverlayNum(cat.overlayIndex)
+            local n = GetPedHeadOverlayNum(cat.overlayIndex)
+            local dStart = rangeMin and math.max(0, rangeMin) or 0
+            local dEnd   = rangeMax and math.min(n - 1, rangeMax) or (n - 1)
+            if dEnd >= dStart then
+                totalItems = totalItems + (dEnd - dStart + 1)
+            end
         end
     end
 
@@ -1092,31 +1344,40 @@ local function CaptureOverlays(ped, gender, selectedSet)
         if isCancelled then return end
         if selectedSet and not selectedSet[cat.overlayIndex] then goto nextOverlay end
 
+        local numVariations = GetPedHeadOverlayNum(cat.overlayIndex)
+        local dStart = rangeMin and math.max(0, rangeMin) or 0
+        local dEnd   = rangeMax and math.min(numVariations - 1, rangeMax) or (numVariations - 1)
+        if dEnd < dStart then goto nextOverlay end
+
         ResetPedForCategory(ped, cat.visibleComponents, cat.componentOverrides)
         hideHeadActive = false
 
-        -- Clear all overlays first so only the target overlay is visible
         for i = 0, 12 do SetPedHeadOverlay(ped, i, 255, 1.0) end
 
         local preset, hasSaved = SetupCategoryCamera(ped, cat.camera)
-        local numVariations = GetPedHeadOverlayNum(cat.overlayIndex)
 
-        for variationId = 0, numVariations - 1 do
+        for variationId = dStart, dEnd do
             if isCancelled then return end
             WaitForResume()
             if isCancelled then return end
 
-            ApplyOverlayWithColor(ped, cat.overlayIndex, variationId)
-            ReapplyRotation(ped, preset, hasSaved)
-            Wait(Customize.WaitAfterApply)
+            local filename = BuildPhotoKey(gender, 'overlay', cat.overlayIndex, variationId, 0)
+            if ShouldSkipKey(filename) then
+                captured = captured + 1
+                SendProgress(captured, totalItems, cat.label, 'overlays')
+                if captured % 50 == 0 then Wait(0) end
+            else
+                ApplyOverlayWithColor(ped, cat.overlayIndex, variationId)
+                ReapplyRotation(ped, preset, hasSaved)
+                Wait(Customize.WaitAfterApply)
 
-            local filename = ('%s/overlay_%d/%d'):format(gender, cat.overlayIndex, variationId)
-            CaptureAndUpload(filename)
+                CaptureAndUpload(filename)
 
-            captured = captured + 1
-            SendProgress(captured, totalItems, cat.label)
-            Wait(Customize.WaitAfterCapture)
-            ThrottledWait()
+                captured = captured + 1
+                SendProgress(captured, totalItems, cat.label, 'overlays')
+                Wait(Customize.WaitAfterCapture)
+                ThrottledWait()
+            end
         end
 
         ::nextOverlay::
@@ -1127,18 +1388,14 @@ end
 -- TATTOOS
 -- ════════════════════════════════════════════════════════
 
--- Known torso tattoos. The shop data's eFacing enum isn't documented, so the
--- value these carry is what "back" / "front" means.
 local TATTOO_BACK_ANCHORS  = { 'MP_Bea_M_Back_000', 'MP_Buis_M_Back_000' }
 local TATTOO_FRONT_ANCHORS = { 'MP_Bea_M_Chest_000', 'MP_Buis_M_Chest_000' }
-local TATTOO_VISIBLE       = { 0, 2 }  -- head + hair; the body comes from Customize.TattooBody
+local TATTOO_VISIBLE       = { 0, 2 }
 
-local tattooList   = nil  -- { zone, collection, male, female }
-local tattooBacks  = nil  -- overlay hash -> true for back-facing shop tattoos
-local tattooGroups = {}   -- gender -> { [TattooCategories index] = { {collection, overlay}, ... } }
+local tattooList   = nil
+local tattooBacks  = nil
+local tattooGroups = {}
 
--- One sTattooShopItemValues entry: 8 script fields of 8 bytes. A Lua string
--- longer than 40 bytes is never interned, so the native can fill this one in place.
 local function ReadTattooShopItem(faction, index)
     local buf = string.rep('\0', 64)
     Citizen.InvokeNative(0xFF56381874F82086, faction, index, buf)
@@ -1150,7 +1407,7 @@ end
 local function LoadTattooBacks()
     if tattooBacks then return tattooBacks end
     local facings = {}
-    for _, faction in ipairs({ 3, 4 }) do  -- TATTOO_MP_FM, TATTOO_MP_FM_F
+    for _, faction in ipairs({ 3, 4 }) do
         for i = 0, GetNumTattooShopDlcItems(faction) - 1 do
             local preset, facing = ReadTattooShopItem(faction, i)
             if preset ~= 0 then facings[preset] = facing end
@@ -1186,9 +1443,19 @@ local function LoadTattooList()
     local source = Customize.Tattoos
     if type(source) ~= 'table' or next(source) == nil then
         source = nil
-        if GetResourceState('illenium-appearance') == 'started' then
+        if GetResourceState('LNS_Appearance') == 'started' then
+            local code = LoadResourceFile('LNS_Appearance', 'shared/tattoos.lua')
+            local env = {}
+            local chunk = code and load(code, '@LNS_Appearance/shared/tattoos.lua', 't', env)
+            if chunk then
+                local ok, res = pcall(chunk)
+                if ok and type(res) == 'table' then
+                    source = res.Tattoos or res
+                end
+            end
+        end
+        if (type(source) ~= 'table' or next(source) == nil) and GetResourceState('illenium-appearance') == 'started' then
             local code = LoadResourceFile('illenium-appearance', 'customize/tattoos.lua')
-            -- A plain data file: run it against a throwaway table, never our globals
             local env = { Customize = {} }
             local chunk = code and load(code, '@illenium-appearance/customize/tattoos.lua', 't', env)
             if chunk and pcall(chunk) then source = env.Customize.Tattoos end
@@ -1203,12 +1470,10 @@ local function LoadTattooList()
             end
         end
     end
-    -- Don't cache an empty result: the appearance resource may just not be up yet
     if #list > 0 then tattooList = list end
     return list
 end
 
--- Tattoos per Customize.TattooCategories index for one gender
 local function GetTattooGroups(gender)
     if tattooGroups[gender] then return tattooGroups[gender] end
     local cats = Customize.TattooCategories or {}
@@ -1235,10 +1500,18 @@ local function GetTattooGroups(gender)
     return groups
 end
 
--- Lowercased so one URL works on case-sensitive hosts whatever casing the
--- list uses ("mpHipster_overlays" and "mphipster_overlays" both appear).
-local function TattooFilename(gender, collection, overlay)
-    return ('%s/tattoos/%s/%s'):format(gender, collection:lower(), overlay:lower())
+local function FindTattooCategoryForOverlay(gender, collection, overlay)
+    local groups = GetTattooGroups(gender)
+    local targetCol = tostring(collection):lower()
+    local targetOv  = tostring(overlay):lower()
+    for catIdx, entries in ipairs(groups) do
+        for _, t in ipairs(entries) do
+            if tostring(t.collection):lower() == targetCol and tostring(t.overlay):lower() == targetOv then
+                return catIdx, t
+            end
+        end
+    end
+    return nil, nil
 end
 
 local function ApplyTattoo(ped, tattoo)
@@ -1268,16 +1541,23 @@ local function CaptureTattoos(ped, gender, selectedSet)
             WaitForResume()
             if isCancelled then return end
 
-            ApplyTattoo(ped, tattoo)
-            ReapplyRotation(ped, preset, hasSaved)
-            Wait(Customize.WaitAfterApply)
+            local filename = TattooFilename(gender, tattoo.collection, tattoo.overlay)
+            if ShouldSkipKey(filename) then
+                captured = captured + 1
+                SendProgress(captured, totalItems, cat.label, 'tattoos')
+                if captured % 50 == 0 then Wait(0) end
+            else
+                ApplyTattoo(ped, tattoo)
+                ReapplyRotation(ped, preset, hasSaved)
+                Wait(Customize.WaitAfterApply)
 
-            CaptureAndUpload(TattooFilename(gender, tattoo.collection, tattoo.overlay))
+                CaptureAndUpload(filename)
 
-            captured = captured + 1
-            SendProgress(captured, totalItems, cat.label)
-            Wait(Customize.WaitAfterCapture)
-            ThrottledWait()
+                captured = captured + 1
+                SendProgress(captured, totalItems, cat.label, 'tattoos')
+                Wait(Customize.WaitAfterCapture)
+                ThrottledWait()
+            end
         end
 
         ClearPedDecorations(ped)
@@ -1290,7 +1570,6 @@ end
 -- ════════════════════════════════════════════════════════
 
 local function CaptureVehicles(selectedModelSet)
-    -- selectedModelSet contains individual model names: { ["adder"] = true, ["zentorno"] = true }
     local totalItems, captured = 0, 0
     local modelsToCapture = {}
 
@@ -1305,30 +1584,34 @@ local function CaptureVehicles(selectedModelSet)
         WaitForResume()
         if isCancelled then return end
 
+        local filename = BuildPhotoKey('male', 'vehicle', model)
+        if ShouldSkipKey(filename) then
+            captured = captured + 1
+            SendProgress(captured, totalItems, model, 'vehicles')
+            if captured % 50 == 0 then Wait(0) end
+            goto nextVeh
+        end
+
         DeleteStudioEntity()
         local veh = SpawnStudioVehicle(model)
         if not veh then goto nextVeh end
 
         Wait(500)
 
-        -- Verify entity position and create camera pointing at it
-        local entityPos = GetEntityCoords(veh)
         local preset = Customize.CameraPresets['vehicle']
         DestroyCamera()
         captureCamera = CreateCaptureCamera(veh, preset, 'vehicle')
         Wait(Customize.WaitAfterApply)
 
         if not DoesEntityExist(veh) then
-            -- Nothing in this resource deletes it mid-capture; a vehicle
-            -- cleanup / anticheat resource is the usual suspect.
             print(('^3[uz_AutoShot]^0 Vehicle %s was deleted before capture (by another resource?), skipped'):format(model))
             goto nextVeh
         end
 
-        CaptureAndUpload('vehicles/' .. model)
+        CaptureAndUpload(filename)
 
         captured = captured + 1
-        SendProgress(captured, totalItems, model)
+        SendProgress(captured, totalItems, model, 'vehicles')
 
         DeleteStudioEntity()
         Wait(Customize.WaitAfterCapture)
@@ -1345,9 +1628,11 @@ end
 local function CaptureObjects(selectedSet)
     local cats = Customize.ObjectCategories or {}
     local totalItems, captured = 0, 0
+    local matched = {}
 
     for _, cat in ipairs(cats) do
         if not selectedSet or selectedSet[cat.model] then
+            matched[cat.model] = true
             totalItems = totalItems + 1
         end
     end
@@ -1357,6 +1642,14 @@ local function CaptureObjects(selectedSet)
         if selectedSet and not selectedSet[cat.model] then goto nextObj end
         WaitForResume()
         if isCancelled then return end
+
+        local filename = BuildPhotoKey('male', 'object', cat.model)
+        if ShouldSkipKey(filename) then
+            captured = captured + 1
+            SendProgress(captured, totalItems, cat.label, 'objects')
+            if captured % 50 == 0 then Wait(0) end
+            goto nextObj
+        end
 
         DeleteStudioEntity()
         local obj = SpawnStudioObject(cat.model)
@@ -1369,16 +1662,45 @@ local function CaptureObjects(selectedSet)
         captureCamera = CreateCaptureCamera(obj, preset, 'object')
         Wait(Customize.WaitAfterApply)
 
-        CaptureAndUpload('objects/' .. cat.model)
+        CaptureAndUpload(filename)
 
         captured = captured + 1
-        SendProgress(captured, totalItems, cat.label)
+        SendProgress(captured, totalItems, cat.label, 'objects')
 
         DeleteStudioEntity()
         Wait(Customize.WaitAfterCapture)
         ThrottledWait()
 
         ::nextObj::
+    end
+
+    -- Also support arbitrary object models passed via headless exports even if unlisted in Customize.ObjectCategories
+    if selectedSet then
+        for model in pairs(selectedSet) do
+            if isCancelled then return end
+            if not matched[model] then
+                WaitForResume()
+                if isCancelled then return end
+                local filename = BuildPhotoKey('male', 'object', model)
+                if not ShouldSkipKey(filename) then
+                    DeleteStudioEntity()
+                    local obj = SpawnStudioObject(model)
+                    if obj then
+                        Wait(500)
+                        local preset = Customize.CameraPresets['object']
+                        DestroyCamera()
+                        captureCamera = CreateCaptureCamera(obj, preset, 'object')
+                        Wait(Customize.WaitAfterApply)
+                        CaptureAndUpload(filename)
+                        DeleteStudioEntity()
+                        Wait(Customize.WaitAfterCapture)
+                        ThrottledWait()
+                    end
+                end
+                captured = captured + 1
+                SendProgress(captured, totalItems, model, 'objects')
+            end
+        end
     end
 end
 
@@ -1390,12 +1712,14 @@ local function CleanupCapture()
     DestroyCamera()
     DeleteStudioEntity()
     HideHUD(false)
-    hideHeadActive = false
-    isCapturing = false
-    isPreview   = false
-    isPaused    = false
-    isCancelled = false
-    captureMode = 'clothing'
+    hideHeadActive    = false
+    isCapturing       = false
+    isPreview         = false
+    isPaused          = false
+    isCancelled       = false
+    captureMode       = 'clothing'
+    activeCaptureOpts = nil
+    captureProgress   = nil
     local ped = PlayerPedId()
     if not IsEntityVisible(ped) then SetEntityVisible(ped, true, false) end
     RestoreFullAppearance()
@@ -1403,11 +1727,34 @@ local function CleanupCapture()
     SetNuiFocus(false, false)
 end
 
+local function FinishCaptureSession(wasCancelled, opts)
+    local cb = opts and opts.onComplete
+    local hideUi = opts and opts.hideOverlay == true
+    local finalMode = captureMode
+    CleanupCapture()
+
+    if not hideUi then
+        SendNUIMessage({ type = 'forceClose' })
+        SendNUIMessage({ type = wasCancelled and 'captureCancelled' or 'captureComplete' })
+    end
+
+    if wasCancelled then
+        TriggerEvent('uz_autoshot:client:captureCancelled', { mode = finalMode })
+    else
+        TriggerEvent('uz_autoshot:client:captureComplete', { mode = finalMode })
+    end
+
+    if type(cb) == 'function' then
+        pcall(cb, not wasCancelled, { cancelled = wasCancelled, mode = finalMode })
+    end
+end
+
 -- ════════════════════════════════════════════════════════
 -- RE-CAPTURE SPECIFIC ITEMS
 -- ════════════════════════════════════════════════════════
 
-local function RecaptureSpecificItems(items)
+local function RecaptureSpecificItems(items, opts)
+    activeCaptureOpts = opts
     local cameraMap, visibilityMap, animMap, overridesMap, hideHeadMap = {}, {}, {}, {}, {}
     for _, cat in ipairs(Customize.Categories) do
         local key = 'component_' .. cat.componentId
@@ -1430,55 +1777,76 @@ local function RecaptureSpecificItems(items)
         visibilityMap[key] = cat.visibleComponents
         hideHeadMap[key]   = false
     end
-    for i, cat in ipairs(Customize.TattooCategories or {}) do
-        local key = 'tattoo_' .. i
-        cameraMap[key]     = cat.camera
-        visibilityMap[key] = TATTOO_VISIBLE
-        overridesMap[key]  = (Customize.TattooBody or {})[captureGender]
-        hideHeadMap[key]   = false
-    end
 
-    local total = #items
-    local model = pedAppearance.model or GetEntityModel(PlayerPedId())
+    local defaultGender = (opts and (opts.gender == 'male' or opts.gender == 'female') and opts.gender) or captureGender
+    captureGender = defaultGender
 
     HideHUD(true)
     TriggerServerEvent('uz_autoshot:server:setBucket', Customize.RoutingBucket)
     Wait(500)
 
-    local ped = SetupCapturePed(model)
+    local ped = SetupCapturePed(GetHashKey(GENDER_MODELS[captureGender]))
     isCapturing  = true
     isPaused     = false
     isCancelled  = false
     batchCounter = 0
 
-    SendNUIMessage({ type = 'captureStart' })
+    if not (opts and opts.hideOverlay) then
+        SendNUIMessage({ type = 'captureStart' })
+    end
     SetNuiFocus(false, false)
     Wait(300)
 
+    local total = #items
     local currentCameraKey = nil
     local currentAnim      = nil
-    local captured = 0
+    local captured         = 0
 
     for _, item in ipairs(items) do
         if isCancelled then break end
         WaitForResume()
         if isCancelled then break end
 
-        local itemKey     = item.type .. '_' .. item.id
-        local visParts    = visibilityMap[itemKey]
-        local animConfig  = animMap[itemKey]
+        local itemGender = (item.gender == 'male' or item.gender == 'female') and item.gender or defaultGender
+        if itemGender ~= captureGender then
+            if currentAnim then StopCategoryAnim(ped); currentAnim = nil end
+            DestroyCamera()
+            currentCameraKey = nil
+            captureGender = itemGender
+            ped = SetupCapturePed(GetHashKey(GENDER_MODELS[captureGender]))
+        end
 
-        -- A tattoo item's drawable is its index in the zone list
-        local tattoo = item.type == 'tattoo' and (GetTattooGroups(captureGender)[item.id] or {})[item.drawable + 1] or nil
-        if item.type == 'tattoo' and not tattoo then goto nextRecaptureItem end
+        local tattoo = nil
+        local itemKey
+        if item.type == 'tattoo' then
+            local catIdx = item.id
+            if item.collection and item.overlay then
+                local foundIdx, foundTattoo = FindTattooCategoryForOverlay(captureGender, item.collection, item.overlay)
+                catIdx = catIdx or foundIdx or 1
+                tattoo = foundTattoo or { collection = item.collection, overlay = item.overlay }
+            else
+                tattoo = (GetTattooGroups(captureGender)[catIdx] or {})[(item.drawable or 0) + 1]
+            end
+            if not tattoo then goto nextRecaptureItem end
+            itemKey = 'tattoo_' .. tostring(catIdx)
+            local tattooCat = (Customize.TattooCategories or {})[catIdx]
+            cameraMap[itemKey]     = (tattooCat and tattooCat.camera) or 'tattoo_torso'
+            visibilityMap[itemKey] = TATTOO_VISIBLE
+            overridesMap[itemKey]  = (Customize.TattooBody or {})[captureGender]
+            hideHeadMap[itemKey]   = false
+        else
+            itemKey = item.type .. '_' .. tostring(item.id)
+        end
+
+        local visParts   = visibilityMap[itemKey]
+        local animConfig = animMap[itemKey]
 
         ResetPedForCategory(ped, visParts, overridesMap[itemKey])
         hideHeadActive = hideHeadMap[itemKey] or false
-        -- Never leave the previous item's tattoo on a clothing shot
         ClearPedDecorations(ped)
 
-        local cameraKey = cameraMap[itemKey] or 'torso'
-        local preset    = Customize.CameraPresets[cameraKey]
+        local cameraKey = cameraMap[itemKey] or 'tops'
+        local preset    = Customize.CameraPresets[cameraKey] or Customize.CameraPresets['tops']
         local hasSaved  = GetSavedAngle(cameraKey) ~= nil
 
         if cameraKey ~= currentCameraKey then
@@ -1498,58 +1866,75 @@ local function RecaptureSpecificItems(items)
         end
 
         if item.type == 'overlay' then
-            for i = 0, 12 do SetPedHeadOverlay(ped, i, 255, 1.0) end
-            ApplyOverlayWithColor(ped, item.id, item.drawable)
+            local filename = BuildPhotoKey(captureGender, 'overlay', item.id, item.drawable, 0)
+            if not ShouldSkipKey(filename) then
+                for i = 0, 12 do SetPedHeadOverlay(ped, i, 255, 1.0) end
+                ApplyOverlayWithColor(ped, item.id, item.drawable)
+                ReapplyRotation(ped, preset, hasSaved)
+                Wait(Customize.WaitAfterApply)
+                CaptureAndUpload(filename)
+                Wait(Customize.WaitAfterCapture)
+                ThrottledWait()
+            end
         elseif item.type == 'tattoo' then
-            ApplyTattoo(ped, tattoo)
-        elseif item.type == 'component' then
-            WaitForClothingLoaded(ped, item.id, item.drawable, item.texture)
+            local filename = TattooFilename(captureGender, tattoo.collection, tattoo.overlay)
+            if not ShouldSkipKey(filename) then
+                ApplyTattoo(ped, tattoo)
+                ReapplyRotation(ped, preset, hasSaved)
+                Wait(Customize.WaitAfterApply)
+                CaptureAndUpload(filename)
+                Wait(Customize.WaitAfterCapture)
+                ThrottledWait()
+            end
         else
-            WaitForPropLoaded(ped, item.id, item.drawable, item.texture)
+            local texStart, texEnd
+            if item.allTextures or (opts and opts.allTextures and item.texture == nil) then
+                local count = item.type == 'component'
+                    and GetNumberOfPedTextureVariations(ped, item.id, item.drawable)
+                    or  GetNumberOfPedPropTextureVariations(ped, item.id, item.drawable)
+                texStart, texEnd = 0, math.max(0, count - 1)
+            else
+                local tex = tonumber(item.texture) or 0
+                texStart, texEnd = tex, tex
+            end
+
+            for tex = texStart, texEnd do
+                if isCancelled then break end
+                WaitForResume()
+                if isCancelled then break end
+
+                local filename = BuildPhotoKey(captureGender, item.type, item.id, item.drawable, tex)
+                if not ShouldSkipKey(filename) then
+                    if item.type == 'component' then
+                        WaitForClothingLoaded(ped, item.id, item.drawable, tex)
+                    else
+                        WaitForPropLoaded(ped, item.id, item.drawable, tex)
+                    end
+                    ReapplyRotation(ped, preset, hasSaved)
+                    Wait(Customize.WaitAfterApply)
+                    CaptureAndUpload(filename)
+                    Wait(Customize.WaitAfterCapture)
+                    ThrottledWait()
+                end
+            end
         end
 
-        ReapplyRotation(ped, preset, hasSaved)
-        Wait(Customize.WaitAfterApply)
-
-        local filename
-        if item.type == 'overlay' then
-            filename = ('%s/overlay_%d/%d'):format(captureGender, item.id, item.drawable)
-        elseif item.type == 'tattoo' then
-            filename = TattooFilename(captureGender, tattoo.collection, tattoo.overlay)
-        elseif item.type == 'component' then
-            filename = item.texture > 0
-                and ('%s/%d/%d_%d'):format(captureGender, item.id, item.drawable, item.texture)
-                or  ('%s/%d/%d'):format(captureGender, item.id, item.drawable)
-        else
-            filename = item.texture > 0
-                and ('%s/prop_%d/%d_%d'):format(captureGender, item.id, item.drawable, item.texture)
-                or  ('%s/prop_%d/%d'):format(captureGender, item.id, item.drawable)
-        end
-
-        CaptureAndUpload(filename)
         captured = captured + 1
         SendProgress(captured, total, item.type == 'component' and tostring(item.id)
             or item.type == 'tattoo' and tattoo.overlay
-            or (item.type .. '_' .. item.id))
-        Wait(Customize.WaitAfterCapture)
-        ThrottledWait()
+            or (item.type .. '_' .. tostring(item.id)), 'recapture')
         ::nextRecaptureItem::
     end
 
-    -- Let in-flight uploads land so "complete" means the files are on disk
     WaitForPendingUploads(0)
     local wasCancelled = isCancelled
-    CleanupCapture()
-    SendNUIMessage({ type = 'forceClose' })
-    SendNUIMessage({ type = wasCancelled and 'captureCancelled' or 'captureComplete' })
+    FinishCaptureSession(wasCancelled, opts)
 end
 
 -- ════════════════════════════════════════════════════════
 -- CAPTURE PREVIEW + RUN
 -- ════════════════════════════════════════════════════════
 
--- includeDrawables: wardrobe, which also needs each tattoo zone's list to
--- build thumbnails; an item's drawable is its index in that list
 local function BuildCategoryList(includeDrawables, includeTattoos)
     local categories = {}
     for _, cat in ipairs(Customize.Categories) do
@@ -1578,7 +1963,6 @@ local function BuildCategoryList(includeDrawables, includeTattoos)
             categories[#categories + 1] = entry
         end
     end
-    -- Group vehicles by class
     local vehCats = GetVehicleCategories()
     local classGroups = {}
     local classOrder = {}
@@ -1603,16 +1987,17 @@ local function BuildCategoryList(includeDrawables, includeTattoos)
 end
 
 local function EnterCapturePreview()
-    if isCapturing or isPreview then
+    if isCapturing or isPreview or isBrowsing then
         BeginTextCommandThefeedPost('STRING')
         AddTextComponentSubstringPlayerName('Capture already in progress!')
         EndTextCommandThefeedPostTicker(false, false)
-        return
+        return false
     end
-    if not ServerReady() then return end
+    if not ServerReady() then return false end
 
     savedCameraAngles   = {}
     activePreviewCamera = nil
+    activeCaptureOpts   = nil
     isPreview           = true
 
     local ped = PlayerPedId()
@@ -1623,8 +2008,6 @@ local function EnterCapturePreview()
     Wait(500)
     HideHUD(true)
 
-    -- Clothing only exists on the freemode peds; any other player model
-    -- (story/addon ped) starts the studio on the male one
     ped = SetupCapturePed(GetHashKey(GENDER_MODELS[captureGender]))
 
     local categories = BuildCategoryList(false, true)
@@ -1632,9 +2015,9 @@ local function EnterCapturePreview()
 
     SendNUIMessage({ type = 'capturePreview', categories = categories, gender = captureGender })
     SetNuiFocus(true, true)
+    return true
 end
 
--- Full reset between capture phases — destroys everything, restores clean state
 local function ResetCapturePhase()
     DestroyCamera()
     DeleteStudioEntity()
@@ -1645,7 +2028,6 @@ local function ResetCapturePhase()
     Wait(200)
 end
 
--- Setup studio for vehicle/object capture phase
 local function SetupEntityCapturePhase(mode)
     ResetCapturePhase()
     captureMode = mode
@@ -1656,15 +2038,13 @@ local function SetupEntityCapturePhase(mode)
     Wait(200)
 end
 
-local function RunCapture(selectedComponents, selectedProps, selectedVehicles, selectedObjects, selectedOverlays, bothGenders, selectedTattoos)
-    -- The category on screen when Start was pressed is captured exactly as
-    -- previewed even without "save angle"; every other unsaved category
-    -- falls back to its own preset in CreateCaptureCamera.
+local function RunCapture(selectedComponents, selectedProps, selectedVehicles, selectedObjects, selectedOverlays, bothGenders, selectedTattoos, opts)
+    activeCaptureOpts = opts
     if activePreviewCamera and not savedCameraAngles[AngleKey(activePreviewCamera)] then
         SnapshotOrbitAngle(activePreviewCamera)
     end
-    captureRotOffset = math.deg(orbitAngleH) - Customize.StudioHeading
-    entitySpawnToken = entitySpawnToken + 1  -- preview spawns still loading must not land in the capture
+    captureRotOffset = orbitCam and (math.deg(orbitAngleH) - Customize.StudioHeading) or 0.0
+    entitySpawnToken = entitySpawnToken + 1
     DestroyOrbitCamera()
     DeleteStudioEntity()
 
@@ -1675,8 +2055,8 @@ local function RunCapture(selectedComponents, selectedProps, selectedVehicles, s
     batchCounter = 0
 
     local compSet, propSet = {}, {}
-    for _, id in ipairs(selectedComponents) do compSet[id] = true end
-    for _, id in ipairs(selectedProps) do propSet[id] = true end
+    for _, id in ipairs(selectedComponents or {}) do compSet[id] = true end
+    for _, id in ipairs(selectedProps or {}) do propSet[id] = true end
 
     local overlaySet, tattooSet = {}, {}
     for _, id in ipairs(selectedOverlays or {}) do overlaySet[id] = true end
@@ -1690,11 +2070,13 @@ local function RunCapture(selectedComponents, selectedProps, selectedVehicles, s
     local hasVeh = next(vehSet)
     local hasObj = next(objSet)
 
-    SendNUIMessage({ type = 'captureStart' })
+    if not (opts and opts.hideOverlay) then
+        SendNUIMessage({ type = 'captureStart' })
+    end
     SetNuiFocus(false, false)
     Wait(300)
 
-    -- ── Phase 1: Clothing + Ped Props + Overlays + Tattoos (previewed gender first) ──
+    -- ── Phase 1: Clothing + Ped Props + Overlays + Tattoos ──
     if hasPed and not isCancelled then
         local genders = { captureGender }
         if bothGenders then genders[2] = OtherGender(captureGender) end
@@ -1707,13 +2089,11 @@ local function RunCapture(selectedComponents, selectedProps, selectedVehicles, s
             end
             captureMode = 'clothing'
             local ped = PlayerPedId()
-            -- Previewing a vehicle/object hides the ped; starting from that tab
-            -- would otherwise shoot every clothing item on an invisible ped.
             if not IsEntityVisible(ped) then SetEntityVisible(ped, true, false) end
-            CaptureComponents(ped, captureGender, compSet)
-            if not isCancelled then CaptureProps(ped, captureGender, propSet) end
-            if not isCancelled then CaptureOverlays(ped, captureGender, overlaySet) end
-            if not isCancelled then CaptureTattoos(ped, captureGender, tattooSet) end
+            if next(compSet) then CaptureComponents(ped, captureGender, compSet) end
+            if not isCancelled and next(propSet) then CaptureProps(ped, captureGender, propSet) end
+            if not isCancelled and next(overlaySet) then CaptureOverlays(ped, captureGender, overlaySet) end
+            if not isCancelled and next(tattooSet) then CaptureTattoos(ped, captureGender, tattooSet) end
         end
     end
 
@@ -1731,8 +2111,7 @@ local function RunCapture(selectedComponents, selectedProps, selectedVehicles, s
 
     WaitForPendingUploads(0)
     local wasCancelled = isCancelled
-    CleanupCapture()
-    SendNUIMessage({ type = wasCancelled and 'captureCancelled' or 'captureComplete' })
+    FinishCaptureSession(wasCancelled, opts)
 end
 
 local function CancelPreview()
@@ -1769,7 +2148,15 @@ end
 local function DrawHeadChromaMask(ped)
     if not hideHeadActive then return end
     local gs = Customize.GreenScreen
-    local r, g, b = gs.color.r, gs.color.g, gs.color.b
+    local chromaPreset = (activeCaptureOpts and activeCaptureOpts.chromaKey) or Customize.ChromaKeyColor
+    local r, g, b
+    if chromaPreset == 'green' then
+        r, g, b = 0, 177, 64
+    elseif chromaPreset == 'magenta' then
+        r, g, b = 255, 0, 255
+    else
+        r, g, b = gs.color.r, gs.color.g, gs.color.b
+    end
     local hm = Customize.HeadMask or {}
 
     local headBone = GetPedBoneCoords(ped, 31086, 0.0, 0.0, 0.0) -- SKEL_Head
@@ -1786,10 +2173,6 @@ local function DrawHeadChromaMask(ped)
             false, false, 2, false, nil, nil, false)
     end
 
-    -- HeadMask can be either a single mask table (legacy) or an array of
-    -- mask tables (e.g. one for the head + one for the neck/jaw). The array
-    -- form lets users stack multiple spheres so they can mask the head and
-    -- the neck independently without one shape clipping clothing.
     if hm[1] then
         for _, m in ipairs(hm) do drawSphere(m) end
     else
@@ -1798,7 +2181,7 @@ local function DrawHeadChromaMask(ped)
 end
 
 -- ════════════════════════════════════════════════════════
--- CROSSHAIR OVERLAY (preview only)
+-- CROSSHAIR & DEBUG OVERLAY (preview only)
 -- ════════════════════════════════════════════════════════
 
 local function DrawCrosshair()
@@ -1810,10 +2193,6 @@ local function DrawCrosshair()
     DrawRect(cx, cy, thick, size * 2 * (16.0/9.0), 255, 255, 255, a)
     DrawRect(cx, cy, 0.003, 0.003 * (16.0/9.0), 255, 80, 80, 200)
 end
-
--- ════════════════════════════════════════════════════════
--- DEBUG CAMERA OVERLAY (preview only)
--- ════════════════════════════════════════════════════════
 
 local function DrawDebugText(x, y, text)
     SetTextFont(0)
@@ -1846,8 +2225,8 @@ local function DrawCameraDebugOverlay()
     DrawDebugText(x, startY + gap * 2,   ('Dist: %.2f'):format(orbitDist))
     DrawDebugText(x, startY + gap * 3,   ('AngleH: %.1f'):format(math.deg(orbitAngleH)))
     DrawDebugText(x, startY + gap * 4,   ('CamZ: %.2f'):format(orbitCamZ))
-    DrawDebugText(x, startY + gap * 5, ('zPos: %.2f'):format(zPos))
-    DrawDebugText(x, startY + gap * 6, ('Roll: %.1f'):format(orbitRoll))
+    DrawDebugText(x, startY + gap * 5,   ('zPos: %.2f'):format(zPos))
+    DrawDebugText(x, startY + gap * 6,   ('Roll: %.1f'):format(orbitRoll))
 end
 
 -- ════════════════════════════════════════════════════════
@@ -1863,7 +2242,10 @@ CreateThread(function()
             ClearPedTasksImmediately(ped)
             local target = (captureMode ~= 'clothing' and spawnedEntity and DoesEntityExist(spawnedEntity))
                 and spawnedEntity or ped
-            if Customize.TransparentBg then DrawGreenScreenAndLights(target) end
+            local activeTransp = (activeCaptureOpts and activeCaptureOpts.transparent ~= nil)
+                and activeCaptureOpts.transparent
+                or Customize.TransparentBg
+            if activeTransp then DrawGreenScreenAndLights(target) end
             if captureMode == 'clothing' then DrawHeadChromaMask(ped) end
             if (isPreview or isBrowsing) and not isCapturing then
                 DrawCropOverlay()
@@ -1880,8 +2262,9 @@ end)
 -- ════════════════════════════════════════════════════════
 
 local function OpenClothingMenu()
-    if isCapturing or isPreview then return end
+    if isCapturing or isPreview or isBrowsing then return false end
     isBrowsing = true
+    activeCaptureOpts = nil
 
     local ped = PlayerPedId()
     captureGender = GetPedGender(ped)
@@ -1903,6 +2286,7 @@ local function OpenClothingMenu()
         categories = categories,
         imgExt     = SavedImageExt(),
     })
+    return true
 end
 
 -- ════════════════════════════════════════════════════════
@@ -1912,10 +2296,20 @@ end
 RegisterNUICallback('startCapture', function(data, cb)
     cb('ok')
     if not isPreview then return end
-    CreateThread(function() RunCapture(data.selectedComponents or {}, data.selectedProps or {}, data.selectedVehicles or {}, data.selectedObjects or {}, data.selectedOverlays or {}, data.bothGenders == true, data.selectedTattoos or {}) end)
+    CreateThread(function()
+        RunCapture(
+            data.selectedComponents or {},
+            data.selectedProps or {},
+            data.selectedVehicles or {},
+            data.selectedObjects or {},
+            data.selectedOverlays or {},
+            data.bothGenders == true,
+            data.selectedTattoos or {},
+            nil
+        )
+    end)
 end)
 
--- Swap the studio ped between the freemode models during preview
 RegisterNUICallback('setCaptureGender', function(data, cb)
     local model = GENDER_MODELS[data.gender]
     if not isPreview or isCapturing or not model then
@@ -1925,10 +2319,8 @@ RegisterNUICallback('setCaptureGender', function(data, cb)
     if data.gender ~= captureGender then
         local ped = SetupCapturePed(GetHashKey(model))
         captureGender = data.gender
-        -- SetPlayerModel makes the new ped visible; keep it hidden behind a vehicle/object preview
         if captureMode ~= 'clothing' then SetEntityVisible(ped, false, false) end
     end
-    -- Some tattoos exist for one gender only, so the per-category counts change
     local tattooCounts = {}
     for i, group in ipairs(GetTattooGroups(captureGender)) do tattooCounts[i] = #group end
     cb({ gender = captureGender, tattooCounts = tattooCounts })
@@ -1969,7 +2361,6 @@ RegisterNUICallback('applyClothing', function(data, cb)
         if data.drawable == -1 then ClearPedProp(ped, data.id)
         else SetPedPropIndex(ped, data.id, data.drawable, data.texture, true) end
     elseif data.itemType == 'overlay' then
-        -- Clear all overlays, then apply selected one with correct color
         for i = 0, 12 do SetPedHeadOverlay(ped, i, 255, 1.0) end
         ApplyOverlayWithColor(ped, data.id, data.drawable)
     elseif data.itemType == 'tattoo' then
@@ -2010,18 +2401,14 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
     end
 
     if (isPreview or isBrowsing) and data.categoryType and data.categoryId ~= nil then
-        -- Any category switch (clothing included) supersedes vehicle/object
-        -- spawns still loading, so they can't pop in after the switch.
         entitySpawnToken = entitySpawnToken + 1
 
         if isEntityMode then
-            -- Must run in a thread because we need Wait() for model loading
             local myToken = entitySpawnToken
 
             CreateThread(function()
                 local ped = PlayerPedId()
 
-                -- Delete previous entity first
                 DeleteStudioEntity()
                 Wait(0)
                 if entitySpawnToken ~= myToken then return end
@@ -2031,7 +2418,6 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
                 captureMode = data.categoryType
 
                 if data.categoryType == 'vehicle' then
-                    -- categoryId is class name; spawn first model of that class, or use firstModel if provided
                     local modelToSpawn = data.firstModel
                     if not modelToSpawn then
                         for _, cat in ipairs(GetVehicleCategories()) do
@@ -2049,10 +2435,6 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
                 end
 
                 Wait(300)
-                -- Superseded while settling. The newer request already
-                -- deleted our entity and spawnedEntity now belongs to it;
-                -- deleting here would remove *its* vehicle (the "appears
-                -- then vanishes after 0.3s" bug).
                 if entitySpawnToken ~= myToken then return end
 
                 if spawnedEntity and DoesEntityExist(spawnedEntity) then
@@ -2074,7 +2456,6 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
         else
             local ped = PlayerPedId()
 
-            -- Switching to clothing/prop preview
             if captureMode ~= 'clothing' then
                 DeleteStudioEntity()
                 SetEntityVisible(ped, true, false)
@@ -2121,12 +2502,10 @@ RegisterNUICallback('setCameraPreset', function(data, cb)
 
             hideHeadActive = shouldHideHead
             ResetPedForCategory(ped, visComps, compOverrides)
-            -- Always clear overlays and tattoos when switching categories
             for i = 0, 12 do SetPedHeadOverlay(ped, i, 255, 1.0) end
             ClearPedDecorations(ped)
 
             if data.categoryType == 'overlay' then
-                -- Show first variation as preview with correct color
                 ApplyOverlayWithColor(ped, data.categoryId, 0)
             elseif data.categoryType == 'tattoo' then
                 local group = GetTattooGroups(captureGender)[data.categoryId]
@@ -2309,6 +2688,7 @@ RegisterNUICallback('recaptureItems', function(data, cb)
     captureRotOffset = 0.0
     isPreview        = false
     isBrowsing       = false
+    activeCaptureOpts = nil
 
     local cameraMap = {}
     for _, cat in ipairs(Customize.Categories) do cameraMap['component_' .. cat.componentId] = cat.camera end
@@ -2330,7 +2710,7 @@ RegisterNUICallback('recaptureItems', function(data, cb)
     end
 
     DestroyOrbitCamera()
-    CreateThread(function() RecaptureSpecificItems(items) end)
+    CreateThread(function() RecaptureSpecificItems(items, nil) end)
 end)
 
 -- ════════════════════════════════════════════════════════
@@ -2340,9 +2720,8 @@ end)
 RegisterCommand(Customize.Command, function() EnterCapturePreview() end, Customize.AceRestricted)
 RegisterCommand(Customize.MenuCommand, function() OpenClothingMenu() end, Customize.AceRestricted)
 
--- Single vehicle capture command
 RegisterCommand('shotcar', function(_, args)
-    if isCapturing or isPreview then return end
+    if isCapturing or isPreview or isBrowsing then return end
     if #args == 0 then
         BeginTextCommandThefeedPost('STRING')
         AddTextComponentSubstringPlayerName('Usage: /shotcar <modelname>')
@@ -2362,6 +2741,7 @@ RegisterCommand('shotcar', function(_, args)
 
     isPreview = true
     captureMode = 'vehicle'
+    activeCaptureOpts = nil
     SaveFullAppearance(PlayerPedId())
     TriggerServerEvent('uz_autoshot:server:setBucket', Customize.RoutingBucket)
     Wait(500)
@@ -2398,9 +2778,8 @@ RegisterCommand('shotcar', function(_, args)
     end
 end, Customize.AceRestricted)
 
--- Single object capture command
 RegisterCommand('shotprop', function(_, args)
-    if isCapturing or isPreview then return end
+    if isCapturing or isPreview or isBrowsing then return end
     if #args == 0 then
         BeginTextCommandThefeedPost('STRING')
         AddTextComponentSubstringPlayerName('Usage: /shotprop <modelname>')
@@ -2420,6 +2799,7 @@ RegisterCommand('shotprop', function(_, args)
 
     isPreview = true
     captureMode = 'object'
+    activeCaptureOpts = nil
     SaveFullAppearance(PlayerPedId())
     TriggerServerEvent('uz_autoshot:server:setBucket', Customize.RoutingBucket)
     Wait(500)
@@ -2456,7 +2836,6 @@ RegisterCommand('shotprop', function(_, args)
     end
 end, Customize.AceRestricted)
 
--- Single entity capture confirmation
 RegisterNUICallback('confirmSingleCapture', function(data, cb)
     cb('ok')
     if not isPreview or not spawnedEntity then return end
@@ -2465,7 +2844,6 @@ RegisterNUICallback('confirmSingleCapture', function(data, cb)
     local camName = eType == 'vehicle' and 'vehicle' or 'object'
 
     CreateThread(function()
-        -- Single capture: the orbit the user just confirmed is the shot
         SnapshotOrbitAngle(camName)
         captureRotOffset = math.deg(orbitAngleH) - Customize.StudioHeading
         DestroyOrbitCamera()
@@ -2485,10 +2863,9 @@ RegisterNUICallback('confirmSingleCapture', function(data, cb)
         local folder = eType == 'vehicle' and 'vehicles' or 'objects'
         CaptureAndUpload(folder .. '/' .. model)
 
-        SendProgress(1, 1, model)
+        SendProgress(1, 1, model, eType)
         WaitForPendingUploads(0)
-        CleanupCapture()
-        SendNUIMessage({ type = 'captureComplete' })
+        FinishCaptureSession(false, activeCaptureOpts)
     end)
 end)
 
@@ -2498,42 +2875,396 @@ RegisterNUICallback('cancelSingleCapture', function(_, cb)
 end)
 
 -- ════════════════════════════════════════════════════════
+-- HEADLESS / PROGRAMMATIC CAPTURE HELPERS
+-- ════════════════════════════════════════════════════════
+
+local function ExpandCategorySelection(val, allList, idKey)
+    if val == nil then return {} end
+    if val == 'all' or val == true then
+        local out = {}
+        for i, entry in ipairs(allList) do
+            out[#out + 1] = idKey and entry[idKey] or i
+        end
+        return out
+    end
+    if type(val) == 'table' then return val end
+    return { val }
+end
+
+local function EnsureMappingsSynced()
+    if imageMappingState.synced then return end
+    TriggerServerEvent('uz_autoshot:server:requestMappings')
+    local timeout = GetGameTimer() + 2500
+    while not imageMappingState.synced and GetGameTimer() < timeout do Wait(50) end
+end
+
+local function StartHeadlessCapture(options)
+    if isCapturing or isPreview or isBrowsing then
+        return { started = false, reason = 'AutoShot studio or capture is already active.' }
+    end
+
+    local opts = type(options) == 'table' and options or {}
+
+    local comps    = ExpandCategorySelection(opts.components, Customize.Categories or {}, 'componentId')
+    local props    = ExpandCategorySelection(opts.props, Customize.PropCategories or {}, 'propId')
+    local overlays = ExpandCategorySelection(opts.overlays, Customize.OverlayCategories or {}, 'overlayIndex')
+    local tattoos  = ExpandCategorySelection(opts.tattoos, Customize.TattooCategories or {}, nil)
+
+    local vehicles = {}
+    if opts.vehicles == 'all' then
+        for _, cat in ipairs(GetVehicleCategories()) do vehicles[#vehicles + 1] = cat.model end
+    elseif type(opts.vehicles) == 'table' then
+        vehicles = opts.vehicles
+    elseif type(opts.vehicles) == 'string' and opts.vehicles ~= '' then
+        vehicles = { opts.vehicles }
+    end
+
+    local objects = {}
+    if opts.objects == 'all' then
+        for _, cat in ipairs(Customize.ObjectCategories or {}) do objects[#objects + 1] = cat.model end
+    elseif type(opts.objects) == 'table' then
+        objects = opts.objects
+    elseif type(opts.objects) == 'string' and opts.objects ~= '' then
+        objects = { opts.objects }
+    end
+
+    if #comps == 0 and #props == 0 and #overlays == 0 and #tattoos == 0 and #vehicles == 0 and #objects == 0 then
+        return { started = false, reason = 'No categories or items specified for capture.' }
+    end
+
+    local ready, reason = ServerReady({
+        format = opts.format,
+        transparent = opts.transparent,
+        silentNotify = true,
+    })
+    if not ready then
+        return { started = false, reason = reason }
+    end
+
+    if opts.skipExisting then
+        EnsureMappingsSynced()
+    end
+
+    savedCameraAngles   = {}
+    activePreviewCamera = nil
+    captureRotOffset    = 0.0
+
+    local ped = PlayerPedId()
+    SaveFullAppearance(ped)
+
+    local bothGenders = opts.bothGenders == true or opts.gender == 'both'
+    local initialGender = (opts.gender == 'female' or opts.gender == 'male')
+        and opts.gender
+        or (bothGenders and 'male' or GetPedGender(ped))
+    captureGender = initialGender
+    isCapturing   = true
+    isPaused      = false
+    isCancelled   = false
+
+    local hasPed = (#comps > 0 or #props > 0 or #overlays > 0 or #tattoos > 0)
+
+    CreateThread(function()
+        TriggerServerEvent('uz_autoshot:server:setBucket', Customize.RoutingBucket)
+        Wait(500)
+        HideHUD(true)
+
+        if hasPed then
+            SetupCapturePed(GetHashKey(GENDER_MODELS[initialGender]))
+        else
+            local p = PlayerPedId()
+            SetEntityCoordsNoOffset(p, Customize.StudioCoords.x, Customize.StudioCoords.y, Customize.StudioCoords.z, false, false, false)
+            FreezeEntityPosition(p, true)
+            SetEntityVisible(p, false, false)
+        end
+
+        RunCapture(comps, props, vehicles, objects, overlays, bothGenders, tattoos, opts)
+    end)
+
+    return { started = true }
+end
+
+local function StartHeadlessRecapture(items, options)
+    if isCapturing or isPreview or isBrowsing then
+        return { started = false, reason = 'AutoShot studio or capture is already active.' }
+    end
+    if type(items) ~= 'table' or #items == 0 then
+        return { started = false, reason = 'No items supplied to recaptureItems.' }
+    end
+
+    local opts = type(options) == 'table' and options or {}
+    local ready, reason = ServerReady({
+        format = opts.format,
+        transparent = opts.transparent,
+        silentNotify = true,
+    })
+    if not ready then
+        return { started = false, reason = reason }
+    end
+
+    if opts.skipExisting then
+        EnsureMappingsSynced()
+    end
+
+    savedCameraAngles   = {}
+    activePreviewCamera = nil
+    captureRotOffset    = 0.0
+
+    local ped = PlayerPedId()
+    captureGender = (opts.gender == 'male' or opts.gender == 'female') and opts.gender or GetPedGender(ped)
+    SaveFullAppearance(ped)
+    isCapturing = true
+    isPaused    = false
+    isCancelled = false
+
+    CreateThread(function()
+        RecaptureSpecificItems(items, opts)
+    end)
+
+    return { started = true }
+end
+
+local function CaptureSingleItem(options)
+    if type(options) ~= 'table' then
+        return { started = false, reason = 'Expected options table in captureItem.' }
+    end
+
+    local itemType = tostring(options.type or 'component'):lower()
+
+    if itemType == 'vehicle' or itemType == 'object' then
+        local modelName = options.model or options.id
+        if type(modelName) ~= 'string' or modelName == '' then
+            return { started = false, reason = 'Missing model name for ' .. itemType .. ' capture.' }
+        end
+        local hash = GetHashKey(modelName)
+        if itemType == 'vehicle' and not IsModelAVehicle(hash) then
+            return { started = false, reason = 'Invalid vehicle model: ' .. modelName }
+        elseif itemType == 'object' and not IsModelValid(hash) then
+            return { started = false, reason = 'Invalid object model: ' .. modelName }
+        end
+        return StartHeadlessCapture({
+            vehicles    = itemType == 'vehicle' and { modelName } or nil,
+            objects     = itemType == 'object' and { modelName } or nil,
+            pathLayout  = options.pathLayout,
+            format      = options.format,
+            quality     = options.quality,
+            width       = options.width,
+            height      = options.height,
+            transparent = options.transparent,
+            chromaKey   = options.chromaKey,
+            hideOverlay = options.hideOverlay,
+            onProgress  = options.onProgress,
+            onComplete  = options.onComplete,
+        })
+    end
+
+    local genders
+    if options.gender == 'both' or options.bothGenders == true then
+        genders = { 'male', 'female' }
+    elseif options.gender == 'male' or options.gender == 'female' then
+        genders = { options.gender }
+    else
+        genders = { GetPedGender(PlayerPedId()) }
+    end
+
+    local items = {}
+    for _, g in ipairs(genders) do
+        items[#items + 1] = {
+            type        = itemType,
+            gender      = g,
+            id          = tonumber(options.id) or options.id,
+            drawable    = tonumber(options.drawable) or 0,
+            texture     = options.texture ~= nil and tonumber(options.texture) or nil,
+            allTextures = options.allTextures == true,
+            collection  = options.collection,
+            overlay     = options.overlay,
+        }
+    end
+
+    return StartHeadlessRecapture(items, options)
+end
+
+-- ════════════════════════════════════════════════════════
 -- EXPORTS
 -- ════════════════════════════════════════════════════════
 
-exports('getPhotoURL', function(gender, itemType, id, drawable, texture)
-    local prefix = itemType == 'overlay' and 'overlay_' or (itemType == 'prop' and 'prop_' or '')
-    -- Mirrors the capture filenames: overlays and texture 0 are always saved
-    -- as <drawable>.<ext>, only texture > 0 gets a _<texture> suffix.
-    if itemType == 'overlay' or not texture or texture == 0 then
-        return ('https://cfx-nui-uz_AutoShot/shots/%s/%s%d/%d.%s'):format(
-            gender, prefix, id, drawable, SavedImageExt()
-        )
+-- URL & Mapping Lookups
+exports('getPhotoURL', function(gender, itemType, id, drawable, texture, opts)
+    return ResolvePhotoURL(gender, itemType, id, drawable, texture, opts, false)
+end)
+
+exports('getMappedPhotoURL', function(gender, itemType, id, drawable, texture, opts)
+    return ResolvePhotoURL(gender, itemType, id, drawable, texture, opts, true)
+end)
+
+exports('resolveKeyURL', function(key, ext)
+    return ResolveKeyURL(key, ext)
+end)
+
+exports('hasImage', function(genderOrKey, itemType, id, drawable, texture, opts)
+    local key
+    if itemType == nil and type(genderOrKey) == 'string' then
+        key = NormalizeImageKey(genderOrKey)
+        if key and imageMappingState.mappings[key] then return true end
+        return false
     end
-    return ('https://cfx-nui-uz_AutoShot/shots/%s/%s%d/%d_%d.%s'):format(
-        gender, prefix, id, drawable, texture, SavedImageExt()
-    )
+    key = BuildPhotoKey(genderOrKey, itemType, id, drawable, texture, opts and opts.pathLayout)
+    if key and imageMappingState.mappings[key] then return true end
+    if not (opts and opts.pathLayout) then
+        local altLayout = GetPathLayout() == 'lns_appearance' and 'autoshot' or 'lns_appearance'
+        local altKey = BuildPhotoKey(genderOrKey, itemType, id, drawable, texture, altLayout)
+        if altKey and imageMappingState.mappings[altKey] then return true end
+    end
+    return false
 end)
 
 exports('getShotsBaseURL', function()
-    return 'https://cfx-nui-uz_AutoShot/shots'
+    return imageMappingState.baseUrl
 end)
 
 exports('getPhotoFormat', function()
     return SavedImageExt()
 end)
 
+exports('getPathLayout', function()
+    return GetPathLayout()
+end)
+
+exports('getImageMappings', function()
+    local copy = {}
+    for k, v in pairs(imageMappingState.mappings or {}) do copy[k] = v end
+    return {
+        storageType = imageMappingState.storageType,
+        baseUrl     = imageMappingState.baseUrl,
+        format      = SavedImageExt(),
+        pathLayout  = GetPathLayout(),
+        synced      = imageMappingState.synced,
+        mappings    = copy,
+    }
+end)
+
+exports('refreshImageMappings', function()
+    imageMappingState.synced = false
+    TriggerServerEvent('uz_autoshot:server:requestMappings')
+    local timeout = GetGameTimer() + 3000
+    while not imageMappingState.synced and GetGameTimer() < timeout do Wait(50) end
+    return imageMappingState
+end)
+
 exports('getVehiclePhotoURL', function(modelName)
-    return ('https://cfx-nui-uz_AutoShot/shots/vehicles/%s.%s'):format(modelName, SavedImageExt())
+    return ResolveKeyURL('vehicles/' .. tostring(modelName))
 end)
 
 exports('getObjectPhotoURL', function(modelName)
-    return ('https://cfx-nui-uz_AutoShot/shots/objects/%s.%s'):format(modelName, SavedImageExt())
+    return ResolveKeyURL('objects/' .. tostring(modelName))
 end)
 
--- collection / overlay as in the tattoo list, e.g. 'mpbeach_overlays', 'MP_Bea_M_Back_000'
 exports('getTattooURL', function(gender, collection, overlay)
-    return ('https://cfx-nui-uz_AutoShot/shots/%s.%s'):format(TattooFilename(gender, collection, overlay), SavedImageExt())
+    return ResolveKeyURL(TattooFilename(gender, collection, overlay))
+end)
+
+exports('getComponentCategoryMap', function()
+    local copy = {}
+    for k, v in pairs(LNS_COMPONENT_FOLDERS) do copy[k] = v end
+    return copy
+end)
+
+exports('getPropCategoryMap', function()
+    local copy = {}
+    for k, v in pairs(LNS_PROP_FOLDERS) do copy[k] = v end
+    return copy
+end)
+
+exports('getCategories', function(includeDrawables, includeTattoos)
+    return BuildCategoryList(includeDrawables == true, includeTattoos ~= false)
+end)
+
+-- UI & Studio Controls
+exports('openCapturePreview', function()
+    return EnterCapturePreview()
+end)
+
+exports('openStudio', function()
+    return EnterCapturePreview()
+end)
+
+exports('openWardrobe', function()
+    return OpenClothingMenu()
+end)
+
+exports('closeStudio', function()
+    if isCapturing then
+        isCancelled = true
+        isPaused = false
+        return true
+    elseif isPreview then
+        SendNUIMessage({ type = 'forceClose' })
+        CancelPreview()
+        return true
+    elseif isBrowsing then
+        SendNUIMessage({ type = 'forceClose' })
+        CloseBrowsing()
+        return true
+    end
+    return false
+end)
+
+exports('pauseCapture', function()
+    if not isCapturing then return false end
+    isPaused = true
+    return true
+end)
+
+exports('resumeCapture', function()
+    if not isCapturing then return false end
+    isPaused = false
+    return true
+end)
+
+exports('cancelCapture', function()
+    if not isCapturing then return false end
+    isCancelled = true
+    isPaused = false
+    return true
+end)
+
+exports('isCapturing', function()
+    return isCapturing
+end)
+
+exports('isStudioOpen', function()
+    return isPreview or isBrowsing or isCapturing
+end)
+
+exports('getCaptureStatus', function()
+    local mappedCount = 0
+    for _ in pairs(imageMappingState.mappings or {}) do mappedCount = mappedCount + 1 end
+    return {
+        isCapturing  = isCapturing,
+        isPaused     = isPaused,
+        isPreview    = isPreview,
+        isBrowsing   = isBrowsing,
+        mode         = captureMode,
+        gender       = captureGender,
+        progress     = captureProgress,
+        storageType  = imageMappingState.storageType,
+        baseUrl      = imageMappingState.baseUrl,
+        format       = SavedImageExt(),
+        pathLayout   = GetPathLayout(),
+        mappedCount  = mappedCount,
+    }
+end)
+
+-- Headless Programmatic Capture
+exports('startCapture', function(options)
+    return StartHeadlessCapture(options)
+end)
+
+exports('captureItem', function(options)
+    return CaptureSingleItem(options)
+end)
+
+exports('recaptureItems', function(items, options)
+    return StartHeadlessRecapture(items, options)
 end)
 
 -- ════════════════════════════════════════════════════════
@@ -2542,11 +3273,6 @@ end)
 
 CreateThread(function()
     while true do
-        -- Polling input every frame only matters when one of these states is
-        -- live; otherwise sleep so the script costs ~nothing in resmon while
-        -- idle. 500ms wake-up is well below the studio + bucket setup that
-        -- follows /shotmaker, so user-perceptible activation lag is unchanged.
-        -- Paused captures fall through here too — no input expected, sleep.
         local pollInput = isBrowsing or isPreview or (isCapturing and not isPaused)
         Wait(pollInput and 0 or 500)
 
@@ -2580,6 +3306,24 @@ CreateThread(function()
                 isCancelled = true
                 isPaused = false
             end
+        end
+    end
+end)
+
+AddEventHandler('onResourceStop', function(resource)
+    if resource ~= RESOURCE_NAME then return end
+    if isCapturing or isPreview or isBrowsing then
+        DestroyCamera()
+        DestroyOrbitCamera()
+        DeleteStudioEntity()
+        HideHUD(false)
+        SetNuiFocus(false, false)
+        local ped = PlayerPedId()
+        if DoesEntityExist(ped) then
+            SetEntityVisible(ped, true, false)
+            SetEntityCollision(ped, true, true)
+            FreezeEntityPosition(ped, false)
+            SetPlayerControl(PlayerId(), true, 0)
         end
     end
 end)

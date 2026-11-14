@@ -180,9 +180,10 @@ All settings live in [`Customize.lua`](Customize.lua). Common knobs:
 |---------|---------|-------------|
 | `Customize.Command` | `'shotmaker'` | Capture command name |
 | `Customize.MenuCommand` | `'wardrobe'` | Browser command name |
-| `Customize.AceRestricted` | `false` | Require ACE permission for commands and capture events |
+| `Customize.AceRestricted` | `false` | Require ACE permission (`command.<cmd>`, `admin`, `group.admin`, Qbox, or ESX admin) |
 | `Customize.ScreenshotFormat` | `'png'` | Output format: `'png'`, `'webp'`, or `'jpg'` |
-| `Customize.TransparentBg` | `true` | Chroma key removal (PNG only) |
+| `Customize.TransparentBg` | `true` | Chroma key removal (`png` and `webp` preserve alpha; `jpg` forces `png`) |
+| `Customize.PathLayout` | `'autoshot'` | Path layout: `'autoshot'` (`male/11/5.png`) or `'lns_appearance'` (`male/tops/5/0.webp`) |
 | `Customize.ScreenshotWidth` | `512` | Output image width |
 | `Customize.ScreenshotHeight` | `512` | Output image height |
 | `Customize.CaptureAllTextures` | `false` | Capture all texture variants (not just default) |
@@ -195,50 +196,120 @@ Camera presets, studio lighting, green screen dimensions, the head chroma mask (
 
 ---
 
-## Lua exports
+## CDN & Server Storage (`server/sv_settings.lua`)
 
-The URL exports return `cfx-nui` paths that any NUI in any resource can render directly via `<img src="...">`. No HTTP request, no base64, no port forwarding.
+Server-side storage, encoding, and mapping persistence are configured in [`server/sv_settings.lua`](server/sv_settings.lua) so credentials are never exposed to clients or NUI:
+
+- `SvSettings.ImageStorage.Type`:
+  - `'local'` — Writes images under `shots/` and serves them via `https://cfx-nui-uz_AutoShot/shots/...`
+  - `'qbox'` — Uploads to Qbox CDN (`Qbox.ApiKey`)
+  - `'fivemanage'` — Uploads to Fivemanage v3 API (`Fivemanage.Url`, `Fivemanage.Token`, `Fivemanage.PublicUrl`, optional `Fivemanage.Folder`)
+  - `'r2'` — Uploads to Cloudflare R2 S3-compatible bucket (`R2.AccountId`, `R2.AccessKeyId`, `R2.SecretAccessKey`, `R2.Bucket`, optional `R2.Folder`, `R2.PublicUrl`)
+- `SvSettings.ImageStorage.WebPQuality`: Lossy WebP quality (`0-100`, default `85`) encoded server-side with `webp-wasm` (preserves chroma-removed alpha transparency).
+- `SvSettings.ImageStorage.SaveLocalCopy`: Also writes a local mirror in `shots/` when using a CDN backend.
+- `SvSettings.ImageStorage.MappingStorage`: `'auto' | 'mysql' | 'json'` (`'auto'` uses `oxmysql` table `autoshot_images` if started, otherwise `shots/mappings.json`). CDN URL mappings sync to clients automatically on connect and live as captures finish.
+
+---
+
+## Lua & JS Exports
+
+### Client URL & Mapping Exports
 
 ```lua
 exports['uz_AutoShot']:getPhotoURL('male', 'component', 11, 5, 0)
--- 'https://cfx-nui-uz_AutoShot/shots/male/11/5.png'
+-- Returns synced CDN/local mapped URL first, or baseUrl fallback:
+--   'autoshot' layout:       'https://cfx-nui-uz_AutoShot/shots/male/11/5.png'
+--   'lns_appearance' layout: 'https://cdn.example.com/male/tops/5/0.webp'
 
-exports['uz_AutoShot']:getPhotoURL('male', 'component', 11, 5, 2)
--- 'https://cfx-nui-uz_AutoShot/shots/male/11/5_2.png'
+exports['uz_AutoShot']:getMappedPhotoURL('male', 'component', 11, 5, 0) -- Mapped URL only (nil if uncaptured)
+exports['uz_AutoShot']:resolveKeyURL('male/tops/5/0')
+exports['uz_AutoShot']:hasImage('male', 'component', 11, 5, 0)
+exports['uz_AutoShot']:getImageMappings()       -- { storageType, baseUrl, format, pathLayout, synced, mappings }
+exports['uz_AutoShot']:refreshImageMappings()   -- Re-syncs mapping cache from server
 
 exports['uz_AutoShot']:getPhotoURL('male', 'prop', 0, 12, 0)
--- 'https://cfx-nui-uz_AutoShot/shots/male/prop_0/12.png'
-
 exports['uz_AutoShot']:getPhotoURL('male', 'overlay', 1, 3, 0)
--- 'https://cfx-nui-uz_AutoShot/shots/male/overlay_1/3.png'
-
 exports['uz_AutoShot']:getVehiclePhotoURL('adder')
--- 'https://cfx-nui-uz_AutoShot/shots/vehicles/adder.png'
-
 exports['uz_AutoShot']:getObjectPhotoURL('prop_bench_01a')
--- 'https://cfx-nui-uz_AutoShot/shots/objects/prop_bench_01a.png'
-
 exports['uz_AutoShot']:getTattooURL('male', 'mpbeach_overlays', 'MP_Bea_M_Back_000')
--- 'https://cfx-nui-uz_AutoShot/shots/male/tattoos/mpbeach_overlays/mp_bea_m_back_000.png'
-
 exports['uz_AutoShot']:getShotsBaseURL()
--- 'https://cfx-nui-uz_AutoShot/shots'
-
 exports['uz_AutoShot']:getPhotoFormat()
--- 'png'  (extension on disk: always 'png' while TransparentBg is on, else Customize.ScreenshotFormat)
+exports['uz_AutoShot']:getPathLayout()
+exports['uz_AutoShot']:getCategories(true, true) -- includeDrawables, includeTattoos
+exports['uz_AutoShot']:getComponentCategoryMap()
+exports['uz_AutoShot']:getPropCategoryMap()
 ```
 
-`getPhotoURL(gender, itemType, id, drawable, texture)` arguments:
+### Client Studio & Headless Capture Exports
 
-- `gender`: `'male'` or `'female'`
-- `itemType`: `'component'`, `'prop'`, or `'overlay'`
-- `id`: component id (1-11, see `Customize.Categories`), prop id (0, 1, 2, 6, 7), or overlay index (0-11)
-- `drawable`: drawable id
-- `texture`: texture id. Ignored for `'overlay'`. `0` (or `nil`) maps to `<drawable>.<ext>`, anything above to `<drawable>_<texture>.<ext>`, matching the files on disk (see Output folder). Textures above 0 only exist if you captured with `Customize.CaptureAllTextures = true`.
+Designed for direct integration with external appearance scripts (such as `LNS_Appearance`):
 
-`getTattooURL(gender, collection, overlay)` takes the collection and overlay name exactly as in the tattoo list (`collection`, `hashMale` / `hashFemale`). Tattoo files are stored lowercased, so the same URL works on Windows and Linux hosts.
+```lua
+-- Open interactive UIs
+exports['uz_AutoShot']:openStudio()         -- Opens capture studio (same as openCapturePreview)
+exports['uz_AutoShot']:openWardrobe()       -- Opens /wardrobe browser
+exports['uz_AutoShot']:closeStudio()        -- Force-closes studio/wardrobe or cancels active capture
 
-All exports return strings synchronously. No async, no callbacks.
+-- Status & control
+exports['uz_AutoShot']:isCapturing()
+exports['uz_AutoShot']:isStudioOpen()
+exports['uz_AutoShot']:getCaptureStatus()
+exports['uz_AutoShot']:pauseCapture()
+exports['uz_AutoShot']:resumeCapture()
+exports['uz_AutoShot']:cancelCapture()
+
+-- Headless batch capture (components / props / overlays / tattoos / vehicles / objects)
+local res = exports['uz_AutoShot']:startCapture({
+    gender        = 'both',              -- 'male' | 'female' | 'both'
+    components    = { 1, 3, 4, 6, 11 },  -- or 'all'
+    props         = { 0, 1 },            -- or 'all'
+    overlays      = {},                  -- or 'all'
+    tattoos       = {},                  -- or 'all'
+    pathLayout    = 'lns_appearance',    -- 'autoshot' | 'lns_appearance'
+    format        = 'webp',              -- 'png' | 'webp' | 'jpg'
+    allTextures   = false,
+    skipExisting  = true,
+    startDrawable = nil,
+    endDrawable   = nil,
+    hideOverlay   = false,
+})
+
+-- Single item / addon recapture
+local itemRes = exports['uz_AutoShot']:captureItem({
+    type        = 'component',           -- 'component' | 'prop' | 'overlay' | 'tattoo' | 'vehicle' | 'object'
+    id          = 11,
+    drawable    = 390,
+    texture     = 0,
+    allTextures = false,
+    gender      = 'both',
+    pathLayout  = 'lns_appearance',
+    format      = 'webp',
+})
+
+-- Targeted batch recapture
+exports['uz_AutoShot']:recaptureItems(itemsArray, opts)
+```
+
+Client local events emitted during headless or interactive sessions:
+- `uz_autoshot:client:progress` `(progressTable)`
+- `uz_autoshot:client:captureComplete` `({ mode })`
+- `uz_autoshot:client:captureCancelled` `({ mode })`
+- `uz_autoshot:client:mappingsChanged` `(imageMappingState)`
+
+### Server Exports
+
+```lua
+exports['uz_AutoShot']:GetSvSettings()
+exports['uz_AutoShot']:GetStorageConfig()
+exports['uz_AutoShot']:GetImageMappings()
+exports['uz_AutoShot']:HasImage(key)
+exports['uz_AutoShot']:GetPhotoURL(gender, itemType, id, drawable, texture, layout)
+exports['uz_AutoShot']:UploadCapture(base64OrBuffer, key, opts) -- opts: { format, width, height, transparent, chromaKey }
+exports['uz_AutoShot']:DeleteMapping(key)
+exports['uz_AutoShot']:ClearMappings()
+```
+
+All `getPhotoURL` / `getMappedPhotoURL` URL lookup exports return synchronously from the synced cache. Headless capture exports return `{ started = boolean, reason = string? }`.
 
 ---
 
@@ -275,7 +346,7 @@ shots/
     └── ...
 ```
 
-After a fresh capture, restart the resource before any other script can `<img src>` the new file. See the first row of Troubleshooting.
+After a fresh local capture (`Type = 'local'`), restart the resource before any other local `cfx-nui` path becomes servable, or use a CDN backend (`qbox`, `fivemanage`, `r2`) so URLs resolve immediately live via synced mappings. See the first row of Troubleshooting.
 
 ---
 
@@ -301,16 +372,18 @@ After a fresh capture, restart the resource before any other script can `<img sr
 
 ```
 uz_AutoShot/
-├── Customize.lua            # All config
+├── Customize.lua            # Client/shared studio config
 ├── fxmanifest.lua
+├── package.json             # Node deps (pngjs, webp-wasm, axios, form-data, @aws-sdk/client-s3)
 ├── client/client.lua        # Capture engine, orbit camera, NUI callbacks, exports
 ├── server/
-│   ├── server.js            # Chroma removal, resize, file write
+│   ├── sv_settings.lua      # Server-only CDN storage & WebP settings (secrets live here)
 │   ├── config_bridge.lua    # Surfaces Customize fields to server.js as convars
+│   ├── server.js            # Chroma removal, resize, WebP encoding, CDN upload & mapping sync
 │   └── version.lua          # Folder-name guard + version check
 ├── resources/src/           # UI source (React + Vite)
 ├── resources/build/         # Pre-built UI, loaded by FiveM
-└── shots/                   # Generated thumbnails (git-ignored)
+└── shots/                   # Generated thumbnails / local mappings (git-ignored)
 ```
 
 ---

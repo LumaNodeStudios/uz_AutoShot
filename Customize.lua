@@ -6,9 +6,10 @@ Customize.MenuCommand       = 'wardrobe'
 Customize.AceRestricted     = false          -- true = ACE permission required (see README)
 Customize.RoutingBucket     = 999
 
-Customize.ScreenshotQuality = 0.92          -- 0.0–1.0 (webp/jpg only)
-Customize.ScreenshotFormat  = 'png'         -- 'png' | 'webp' | 'jpg'
-Customize.TransparentBg     = true          -- chroma key removal (png only)
+Customize.ScreenshotQuality = 0.85          -- 0.0–1.0 (webp/jpg quality)
+Customize.ScreenshotFormat  = 'png'         -- 'png' | 'webp' | 'jpg' ('png' & 'webp' preserve transparency)
+Customize.TransparentBg     = true          -- chroma key removal ('png' & 'webp' keep alpha; 'jpg' forces 'png')
+Customize.PathLayout        = 'autoshot'    -- 'autoshot' ('male/11/5.png') | 'lns_appearance' ('male/tops/5/0.webp')
 Customize.ScreenshotWidth   = 512
 Customize.ScreenshotHeight  = 512
 
@@ -18,7 +19,7 @@ Customize.StudioHeading     = 180.0
 Customize.WaitAfterApply    = 500           -- ms
 Customize.WaitAfterCapture  = 300           -- ms
 Customize.TextureLoadWait   = 600           -- ms
-Customize.CaptureAllTextures = false        -- true = all textures, false = texture 0 only
+Customize.CaptureAllTextures = true        -- true = all textures, false = texture 0 only
 
 -- Batch / Performance
 Customize.BatchSize         = 10

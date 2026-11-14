@@ -17,6 +17,7 @@ client_scripts {
 }
 
 server_scripts {
+    'server/sv_settings.lua',
     'server/version.lua',
     'server/config_bridge.lua',
     'server/server.js',
