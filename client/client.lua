@@ -146,9 +146,12 @@ local function GetPathLayout(layoutOverride)
         layoutOverride
         or (activeCaptureOpts and activeCaptureOpts.pathLayout)
         or Customize.PathLayout
-        or 'autoshot'
-    ):lower()
-    return raw == 'lns_appearance' and 'lns_appearance' or 'autoshot'
+        or 'lns'
+    ):lower():gsub('%s+', '')
+    if raw == 'uz' or raw == 'autoshot' or raw == 'legacy' then
+        return 'autoshot'
+    end
+    return 'lns_appearance'
 end
 
 local function NormalizeImageKey(rawKey)

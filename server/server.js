@@ -61,10 +61,10 @@ try {
 // ════════════════════════════════════════════════════════
 
 function getConvarConfig() {
-    const rawFormat = (GetConvar('uz_autoshot_format', 'png') || 'png').toLowerCase();
+    const rawFormat = (GetConvar('uz_autoshot_format', 'webp') || 'webp').toLowerCase();
     const format = rawFormat === 'jpeg' ? 'jpg' : (rawFormat === 'webp' || rawFormat === 'jpg' ? rawFormat : 'png');
-    const rawLayout = (GetConvar('uz_autoshot_path_layout', 'autoshot') || 'autoshot').toLowerCase();
-    const pathLayout = rawLayout === 'lns_appearance' ? 'lns_appearance' : 'autoshot';
+    const rawLayout = (GetConvar('uz_autoshot_path_layout', 'lns') || 'lns').toLowerCase().trim();
+    const pathLayout = (rawLayout === 'uz' || rawLayout === 'autoshot' || rawLayout === 'legacy') ? 'autoshot' : 'lns_appearance';
     const quality = parseFloat(GetConvar('uz_autoshot_quality', '0.85'));
     return {
         aceRestricted: GetConvar('uz_autoshot_ace_restricted', 'false') === 'true',
@@ -178,7 +178,8 @@ function normalizeKey(rawKey) {
 }
 
 function buildPhotoKey(gender, itemType, id, drawable, texture, layoutOverride) {
-    const layout = (layoutOverride || getConvarConfig().pathLayout || 'autoshot').toLowerCase();
+    const raw = String(layoutOverride || getConvarConfig().pathLayout || 'lns').toLowerCase().trim();
+    const layout = (raw === 'uz' || raw === 'autoshot' || raw === 'legacy') ? 'autoshot' : 'lns_appearance';
     const g = gender === 'female' ? 'female' : 'male';
     const numId = Number(id) || 0;
     const numDraw = Number(drawable) || 0;

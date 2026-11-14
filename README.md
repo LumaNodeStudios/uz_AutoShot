@@ -181,9 +181,9 @@ All settings live in [`Customize.lua`](Customize.lua). Common knobs:
 | `Customize.Command` | `'shotmaker'` | Capture command name |
 | `Customize.MenuCommand` | `'wardrobe'` | Browser command name |
 | `Customize.AceRestricted` | `false` | Require ACE permission (`command.<cmd>`, `admin`, `group.admin`, Qbox, or ESX admin) |
-| `Customize.ScreenshotFormat` | `'png'` | Output format: `'png'`, `'webp'`, or `'jpg'` |
+| `Customize.ScreenshotFormat` | `'webp'` | Output format: `'webp'` (recommended for LNS_Appearance), `'png'`, or `'jpg'` |
 | `Customize.TransparentBg` | `true` | Chroma key removal (`png` and `webp` preserve alpha; `jpg` forces `png`) |
-| `Customize.PathLayout` | `'autoshot'` | Path layout: `'autoshot'` (`male/11/5.png`) or `'lns_appearance'` (`male/tops/5/0.webp`) |
+| `Customize.PathLayout` | `'lns'` | Path layout: `'lns'` / `'lns_appearance'` (`male/tops/5/0.webp`) or `'uz'` / `'autoshot'` (`male/11/5.png`) |
 | `Customize.ScreenshotWidth` | `512` | Output image width |
 | `Customize.ScreenshotHeight` | `512` | Output image height |
 | `Customize.CaptureAllTextures` | `false` | Capture all texture variants (not just default) |

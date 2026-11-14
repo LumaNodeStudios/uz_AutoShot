@@ -7,9 +7,9 @@ Customize.AceRestricted     = false          -- true = ACE permission required (
 Customize.RoutingBucket     = 999
 
 Customize.ScreenshotQuality = 0.85          -- 0.0–1.0 (webp/jpg quality)
-Customize.ScreenshotFormat  = 'png'         -- 'png' | 'webp' | 'jpg' ('png' & 'webp' preserve transparency)
+Customize.ScreenshotFormat  = 'webp'        -- 'webp' (standard for LNS_Appearance) | 'png' | 'jpg'
 Customize.TransparentBg     = true          -- chroma key removal ('png' & 'webp' keep alpha; 'jpg' forces 'png')
-Customize.PathLayout        = 'autoshot'    -- 'autoshot' ('male/11/5.png') | 'lns_appearance' ('male/tops/5/0.webp')
+Customize.PathLayout        = 'lns'         -- 'lns' (standard for LNS_Appearance: 'male/tops/5/0.webp') | 'uz' (legacy: 'male/11/5.png')
 Customize.ScreenshotWidth   = 512
 Customize.ScreenshotHeight  = 512
 
